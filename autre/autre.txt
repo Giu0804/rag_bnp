@@ -1,0 +1,269 @@
+import re
+import pandas as pd
+import requests
+from openai import OpenAI
+
+# ==========================================
+# 0. CONFIGURATION API LLM
+# ==========================================
+def get_client():
+    llama_url = "https://dmn-ap87993-prod-1d595faf.datalab.cloud.echonet/apps-internal/67b88f69b577af3a14c8a11d/v1"
+    api_key = requests.get("http://localhost:8899/access-token").text
+    return OpenAI(base_url=llama_url, api_key=api_key)
+
+# ==========================================
+# 1. GÉNÉRATION VIA API
+# ==========================================
+def generate_llm_response(client, model_name, prompt, max_tokens=350):
+    """Fait l'appel à l'API. On utilise vos prompts entiers en tant que 'user'."""
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": "You are a precise technical AI. You MUST strictly obey all instructions and format your output exactly as requested using the XML tags."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=max_tokens,
+        temperature=0.0
+    )
+    return response.choices[0].message.content
+
+# ==========================================
+# 2. PARSEURS ET MÉTRIQUES
+# ==========================================
+def extract_answer(raw_output):
+    """Extrait la réponse depuis la balise <answer>."""
+    answer_match = re.search(r"<answer>(.*?)</answer>", raw_output, re.DOTALL)
+    return answer_match.group(1).strip() if answer_match else "Format Error (Answer)"
+
+def extract_atomic_claims(raw_output):
+    """Extrait et nettoie la liste des claims depuis la balise <atomic_claims>."""
+    claims_match = re.search(r"<atomic_claims>(.*?)</atomic_claims>", raw_output, re.DOTALL)
+    claims_list = []
+
+    if claims_match:
+        raw_claims_text = claims_match.group(1).strip()
+        raw_claims = raw_claims_text.split('\n-')
+        for claim in raw_claims:
+            cleaned = claim.strip().lstrip('-').strip()
+            if cleaned:
+                claims_list.append(cleaned)
+    return claims_list
+
+def extract_nli_verdict(raw_output):
+    """Extrait l'ID et le LABEL depuis la balise <nli_verdict>."""
+    verdict_match = re.search(r"<nli_verdict>(.*?)</nli_verdict>", raw_output, re.DOTALL)
+
+    if verdict_match:
+        content = verdict_match.group(1)
+        # Extraction de l'ID
+        id_match = re.search(r"ID:\s*(\d+)", content)
+        chunk_id = int(id_match.group(1)) if id_match else None
+
+        # Extraction du Label
+        label_match = re.search(r"LABEL:\s*(ENTAILMENT|NEUTRAL|CONTRADICTION)", content, re.IGNORECASE)
+        label = label_match.group(1).upper() if label_match else "UNKNOWN"
+
+        return chunk_id, label
+
+    return None, "FORMAT_ERROR"
+
+def calculate_metrics(gold_ids, predicted_ids):
+    """Calcule P, R, F1 et Accuracy (Exact Match)."""
+    gold_set = set(gold_ids)
+    pred_set = set(predicted_ids)
+    correct_ids = pred_set.intersection(gold_set)
+
+    p = len(correct_ids) / len(pred_set) if len(pred_set) > 0 else 0.0
+    r = len(correct_ids) / len(gold_set) if len(gold_set) > 0 else 0.0
+    f1 = 2 * (p * r) / (p + r) if (p + r) > 0 else 0.0
+    accuracy = 1.0 if pred_set == gold_set else 0.0
+
+    return {"precision": p, "recall": r, "f1": f1, "accuracy": accuracy}
+
+# ==========================================
+# 3. VOS PROMPTS EXACTS
+# ==========================================
+answer_for_nli = """
+### ROLE:
+You are a precise technical writer. Your goal is to answer the question using ONLY the provided "CONTEXT".
+
+### INSTRUCTIONS:
+1. **Source Fidelity**: Use ONLY the provided context. DO NOT use prior knowledge.
+2. **Entity Density**: Use full names of people, places, and organizations.
+3. **No Pronouns**: NEVER use pronouns (he, she, they, it). Always repeat the full name of the entity.
+4. **Sentence Structure**: Provide a single, clear, and declarative sentence containing all necessary facts to answer the question.
+5. **No Hallucinations**: If the information is missing, write "Insufficient information."
+
+### OUTPUT FORMAT:
+<answer>[Your single, entity-rich sentence]</answer>
+
+### CONTEXT:
+{context_text}
+
+### QUESTION:
+{question}
+"""
+
+atomic_claims = """
+### ROLE:
+You are a linguistic analyst. Your task is to decompose a complex sentence into "Atomic Claims".
+
+### INSTRUCTIONS:
+1. **Deconstruct Facts**: Break the provided "GIVEN ANSWER" into a list of simple, independent, and standalone factual statements.
+2. **No Implicit Info**: Each claim must be self-contained. Replace any remaining pronouns or implicit references with the full entity names.
+3. **Existence & Relations**:
+   - Identify existence (e.g., "Entity X exists" or "Entity X is a [Type]").
+   - Identify relations (e.g., "Entity X is located in Y", "Entity X founded Entity Z").
+4. **No Explanations**: Do not add commentary, context, or reasoning. Just list the facts.
+5. **Format**: Present each claim on a new line starting with a dash (-).
+
+### OUTPUT FORMAT:
+<atomic_claims>
+- [Claim 1]
+- [Claim 2]
+...
+</atomic_claims>
+
+### GIVEN ANSWER:
+{predicted_answer}
+"""
+
+nli_check = """
+### ROLE:
+You are a rigorous logical auditor. Your task is to check if a "SOURCE CHUNK" provides the necessary evidence for an "ATOMIC CLAIM".
+
+### INSTRUCTIONS:
+1. **Strict Evidence**: Only select ENTAILMENT if the SOURCE CHUNK explicitly contains the information to prove the ATOMIC CLAIM.
+2. **Independence**: Evaluate this pair in isolation. Do not use outside knowledge.
+3. **Classification**:
+   - **ENTAILMENT**: The source proves the claim.
+   - **CONTRADICTION**: The source disproves the claim.
+   - **NEUTRAL**: The source does not mention the claim.
+
+### SOURCE CHUNK (ID: {chunk_id}):
+{source_chunk}
+
+### ATOMIC CLAIM:
+{atomic_claim}
+
+### OUTPUT FORMAT:
+<nli_verdict>
+ID: {chunk_id}
+LABEL: [ENTAILMENT, NEUTRAL, or CONTRADICTION]
+</nli_verdict>
+"""
+
+# ==========================================
+# 4. CONTRÔLEUR APPROCHE 5 (ADAPTÉ API)
+# ==========================================
+def evaluate_approach_5(dataset, prompt_answer, prompt_claims, prompt_nli, client, model_name, sample_size=None, output_filename=None):
+    """
+    Évalue l'Approche 5 : LLM génère la réponse -> LLM extrait les claims -> LLM vérifie Claim vs Chunk (N x M).
+    """
+    results = []
+    df_sample = dataset.head(sample_size) if sample_size is not None else dataset
+
+    for index, row in df_sample.iterrows():
+        # --- ÉTAPE A : Génération de la Réponse ---
+        context_text = "\n".join([f"ID: {p['id']} | Paragraph: {p['text']}" for p in row['contexts']])
+
+        prompt_1 = prompt_answer.format(
+            context_text=context_text,
+            question=row['question']
+        )
+        # CHANGEMENT ICI : Appel API
+        raw_output_1 = generate_llm_response(client, model_name, prompt_1)
+        predicted_answer = extract_answer(raw_output_1)
+
+        # --- ÉTAPE B : Décomposition en Atomic Claims ---
+        prompt_2 = prompt_claims.format(
+            predicted_answer=predicted_answer
+        )
+        # CHANGEMENT ICI : Appel API
+        raw_output_2 = generate_llm_response(client, model_name, prompt_2)
+        atomic_claims = extract_atomic_claims(raw_output_2)
+
+        # --- ÉTAPE C : Vérification NLI (Boucle N x M) ---
+        predicted_ids_set = set() # Utilisation d'un set pour éviter les doublons d'IDs
+        detailed_verdicts = []    # Optionnel: pour garder une trace des logs complets
+
+        for chunk in row['contexts']:
+            for claim in atomic_claims:
+                prompt_3 = prompt_nli.format(
+                    chunk_id=chunk['id'],
+                    source_chunk=chunk['text'],
+                    atomic_claim=claim
+                )
+
+                # CHANGEMENT ICI : Appel API
+                raw_output_3 = generate_llm_response(client, model_name, prompt_3)
+                v_id, v_label = extract_nli_verdict(raw_output_3)
+
+                detailed_verdicts.append({"chunk_id": chunk['id'], "claim": claim, "label": v_label})
+
+                # Règle d'agrégation : On garde l'ID si au moins UN claim est "ENTAILMENT"
+                if v_label == "ENTAILMENT" and v_id is not None:
+                    predicted_ids_set.add(v_id)
+
+        # Conversion du set final en liste triée
+        predicted_ids = sorted(list(predicted_ids_set))
+
+        # --- ÉVALUATION ET SAUVEGARDE ---
+        metrics = calculate_metrics(row['gold_ids'], predicted_ids)
+
+        results.append({
+            "sample_id": row['id'],
+            "question": row['question'],
+            "gold_ids": row['gold_ids'],
+            "predicted_ids": predicted_ids,
+            "predicted_answer": predicted_answer,
+            "atomic_claims": atomic_claims,     # On sauvegarde les claims pour analyse
+            "detailed_verdicts": detailed_verdicts, # Et la matrice des verdicts complets
+            **metrics
+        })
+
+        # Affichage visuel
+        print(f"--- SAMPLE {index+1} (ID: {row['id']}) ---")
+        print(f"Question : {row['question']}")
+        print(f"Réponse  : {predicted_answer}")
+        print(f"Nb Claims: {len(atomic_claims)} extraits")
+        print(f"Gold IDs : {row['gold_ids']}")
+        print(f"Pred IDs : {predicted_ids}")
+        print(f"Verdict  : {'✅ Exact' if metrics['accuracy'] else '❌ Différent'} (P: {metrics['precision']:.2f}, R: {metrics['recall']:.2f}, F1: {metrics['f1']:.2f})")
+        print("-" * 50)
+
+    # Agrégation des résultats finaux
+    df_results = pd.DataFrame(results)
+    avg_metrics = df_results[["precision", "recall", "f1", "accuracy"]].mean().to_dict()
+
+    print("\n" + "="*20 + " RÉSULTATS APPROCHE 5 (NLI) " + "="*20)
+    for k, v in avg_metrics.items():
+        print(f"Moyenne {k.capitalize()} : {v:.4f}")
+    print("="*68 + "\n")
+
+    if output_filename:
+        df_results.to_csv(output_filename, index=False, encoding='utf-8')
+        print(f" Résultats sauvegardés dans : {output_filename}")
+
+    return df_results, avg_metrics
+
+# ==========================================
+# 5. LANCEMENT DU SCRIPT
+# ==========================================
+api_client = get_client()
+llama_model = "Meta-Llama-3.3-70B-Instruct"
+
+# ATTENTION: Assurez-vous que votre variable `ds_rag` est bien chargée en mémoire avant ça.
+df_res_app5, metrics_app5 = evaluate_approach_5(
+    dataset=ds_rag, 
+    prompt_answer=answer_for_nli,
+    prompt_claims=atomic_claims,
+    prompt_nli=nli_check,
+    client=api_client,         # Changement: On passe le client API
+    model_name=llama_model,    # Changement: On passe le nom du modèle
+    sample_size=3,             # Je vous conseille de tester sur 3 lignes d'abord
+    output_filename="resultats_approche5_nli_llama3.csv"
+)
+
+# Optionnel : Afficher les résultats
+display(df_res_app5.head())
