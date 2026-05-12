@@ -1,57 +1,58 @@
-import pandas as pd
-import random
+# --- OPTION 1: CITE THEN ANSWER (Original order) ---
+SYSTEM_PROMPT_CITE_THEN_ANSWER = """### ROLE:
+You are a precise Logic Auditor. Your goal is to identify the MINIMAL logical path required to answer a question based EXCLUSIVELY on the provided "[CONTEXT]".
 
-def process_top_k(df, top_k=40, seed=42):
-    """
-    Paramètre le top_k avec les règles spécifiques :
-    - Si pas de gold : prend les top_k distracteurs.
-    - Si golds : prend tous les golds + complète avec les top distracteurs jusqu'à top_k.
-    - Shuffle final pour éviter le biais de position.
-    """
-    processed_data = []
+### CHUNK SELECTION PROTOCOL:
+Identify an ID ONLY if it provides a specific fact required to bridge the gap between the question and the answer.
+1. **Direct Evidence**: Contains the core fact requested.
+2. **Logical Bridge**: Connects entities necessary to reach the conclusion.
+3. **Strict Exclusion**: DO NOT cite chunks for general definitions or background info that doesn't change the final answer.
+*Minimalism*: If removing an ID makes the reasoning chain collapse, keep it. Otherwise, discard it.
 
-    # On itère sur les lignes du DataFrame chargé (celui qui a déjà la colonne 'contexts')
-    for _, row in df.iterrows():
-        all_docs = row['contexts']
+### INSTRUCTIONS:
+- Think step-by-step about which IDs are strictly necessary before finalizing your <chunks_id> list.
+- NO pronouns (he, she, they, it). Use full entity names.
+- Provide a single, clear, declarative sentence.
+- If context is insufficient, write "Insufficient information" in both fields.
 
-        # 1. Identification des golds et distracteurs (basé sur l'index original)
-        # Note : On suppose ici que row['gold_ids'] contient les index des docs True
-        golds = [doc for doc in all_docs if doc['id'] in row['gold_ids']]
-        distractors = [doc for doc in all_docs if doc['id'] not in row['gold_ids']]
+### OUTPUT FORMAT:
+<chunks_id>[Comma-separated list of numerical IDs only]</chunks_id>
+<answer>[Your single, entity-rich sentence]</answer>"""
 
-        # 2. Application de la logique de sélection
-        if not golds:
-            # Cas : Aucune réponse vraie -> On prend les premiers distracteurs
-            selected_docs = distractors[:top_k]
-        else:
-            # Cas : Présence de réponses -> On prend TOUS les golds (même si > top_k)
-            # Et on complète avec les meilleurs distracteurs si on est en dessous du top_k
-            num_distractors_needed = max(0, top_k - len(golds))
-            selected_docs = golds + distractors[:num_distractors_needed]
+# --- OPTION 2: ANSWER THEN CITE (Inverted order) ---
+SYSTEM_PROMPT_ANSWER_THEN_CITE = """### ROLE:
+You are a precise QA agent with a mandatory requirement for evidentiary proof.
 
-        # 3. Shuffle reproductible
-        random.seed(seed)
-        random.shuffle(selected_docs)
+### INSTRUCTIONS:
+1. **Response Phase**: Write a single, declarative sentence using ONLY the [CONTEXT]. 
+   - NO pronouns (he, she, they, it). Use full entity names.
+2. **Evidence Audit Phase**: Review your own answer and the [CONTEXT].
+   - Think step-by-step about which IDs are strictly necessary to prove the facts in your sentence.
+   - Ask yourself: "Can I prove this fact without this specific chunk?" If yes, do NOT include the ID.
+   - EXCLUDE general definitions or redundant background information.
+3. **No Hallucinations**: If context is insufficient, write "Insufficient information" in both fields.
 
-        # 4. Ré-indexation locale (0 à N) pour le nouveau set
-        new_contexts = []
-        new_gold_ids = []
+### OUTPUT FORMAT:
+<answer>[Your single, entity-rich sentence]</answer>
+<chunks_id>[Comma-separated list of numerical IDs only]</chunks_id>"""
 
-        for i, doc in enumerate(selected_docs):
-            new_contexts.append({
-                "id": i,
-                "text": doc['text']
-            })
-            # On vérifie si ce doc était un "vrai" à l'origine
-            if doc['id'] in row['gold_ids']:
-                new_gold_ids.append(i)
+# --- USER PROMPT TEMPLATES (Common to both) ---
+# Note: The Reminder is adapted to the specific flow of each prompt.
 
-        processed_data.append({
-            "id": row['id'],
-            "question": row['question'],
-            "contexts": new_contexts,
-            "gold_ids": sorted(new_gold_ids),
-            "answer": row['answer']
-        })
+USER_PROMPT_CITE_THEN_ANSWER_TEMPLATE = """### [CONTEXT]:
+{context_text}
 
-    return pd.DataFrame(processed_data)
+### [QUESTION]:
+{question}
+
+---
+Reminder: List the minimal <chunks_id> first, then the <answer>."""
+
+USER_PROMPT_ANSWER_THEN_CITE_TEMPLATE = """### [CONTEXT]:
+{context_text}
+
+### [QUESTION]:
+{question}
+
+---
+Reminder: Provide the <answer> first, then the minimal <chunks_id> list."""
