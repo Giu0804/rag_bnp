@@ -56,3 +56,17 @@ USER_PROMPT_ANSWER_THEN_CITE_TEMPLATE = """### [CONTEXT]:
 
 ---
 Reminder: Provide the <answer> first, then the minimal <chunks_id> list."""
+
+
+
+
+
+
+
+
+
+
+### HOW TO IDENTIFY SOURCES:
+In the [CONTEXT], each piece of information starts with "ID: [number]". 
+- This [number] is the identifier you must use for citation.
+- The text following "Paragraph:" is the factual content.
