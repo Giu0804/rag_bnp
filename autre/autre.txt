@@ -1,1 +1,57 @@
-aide
+import pandas as pd
+import random
+
+def process_top_k(df, top_k=40, seed=42):
+    """
+    Paramètre le top_k avec les règles spécifiques :
+    - Si pas de gold : prend les top_k distracteurs.
+    - Si golds : prend tous les golds + complète avec les top distracteurs jusqu'à top_k.
+    - Shuffle final pour éviter le biais de position.
+    """
+    processed_data = []
+
+    # On itère sur les lignes du DataFrame chargé (celui qui a déjà la colonne 'contexts')
+    for _, row in df.iterrows():
+        all_docs = row['contexts']
+
+        # 1. Identification des golds et distracteurs (basé sur l'index original)
+        # Note : On suppose ici que row['gold_ids'] contient les index des docs True
+        golds = [doc for doc in all_docs if doc['id'] in row['gold_ids']]
+        distractors = [doc for doc in all_docs if doc['id'] not in row['gold_ids']]
+
+        # 2. Application de la logique de sélection
+        if not golds:
+            # Cas : Aucune réponse vraie -> On prend les premiers distracteurs
+            selected_docs = distractors[:top_k]
+        else:
+            # Cas : Présence de réponses -> On prend TOUS les golds (même si > top_k)
+            # Et on complète avec les meilleurs distracteurs si on est en dessous du top_k
+            num_distractors_needed = max(0, top_k - len(golds))
+            selected_docs = golds + distractors[:num_distractors_needed]
+
+        # 3. Shuffle reproductible
+        random.seed(seed)
+        random.shuffle(selected_docs)
+
+        # 4. Ré-indexation locale (0 à N) pour le nouveau set
+        new_contexts = []
+        new_gold_ids = []
+
+        for i, doc in enumerate(selected_docs):
+            new_contexts.append({
+                "id": i,
+                "text": doc['text']
+            })
+            # On vérifie si ce doc était un "vrai" à l'origine
+            if doc['id'] in row['gold_ids']:
+                new_gold_ids.append(i)
+
+        processed_data.append({
+            "id": row['id'],
+            "question": row['question'],
+            "contexts": new_contexts,
+            "gold_ids": sorted(new_gold_ids),
+            "answer": row['answer']
+        })
+
+    return pd.DataFrame(processed_data)
