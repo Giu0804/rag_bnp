@@ -1,9 +1,24 @@
 FEW_SHOT_USER = """### CONTEXT:
-ID: 12 | Paragraph: L'entreprise X a été fondée en 2010 par Jean Dupont.
-ID: 15 | Paragraph: Jean Dupont a nommé Marie Courtois directrice générale en 2018.
+ID: 1 | Paragraph: Company ABC is located in Paris and has 215 employees.
+ID: 2 | Paragraph: Company ABC was founded in 2010 by Jean Dupont.
+ID: 3 | Paragraph: Marie Courtois studied Law before joining Company ABC.
+ID: 4 | Paragraph: Jean Dupont appointed Marie Courtois as CEO in 2018.
 
 ### QUESTION:
-Qui est la directrice générale de l'entreprise X ?"""
+Who is the CEO of Company ABC?"""
 
-FEW_SHOT_ASSISTANT = """<chunks_id>12, 15</chunks_id>
-<answer>Marie Courtois est la directrice générale de l'entreprise X.</answer>"""
+FEW_SHOT_OUTPUT = """<chunks_id>2, 4</chunks_id>
+<answer>Marie Courtois is the CEO of Company X.</answer>"""
+
+
+messages = [
+        # 1. Vos règles du jeu
+        {"role": "system", "content": system_prompt},
+        
+        # 2. L'EXEMPLE FEW-SHOT (Input / Output)
+        {"role": "user", "content": FEW_SHOT_INPUT},
+        {"role": "assistant", "content": FEW_SHOT_OUTPUT},
+        
+        # 3. La vraie question du dataset
+        {"role": "user", "content": user_prompt}
+    ]
