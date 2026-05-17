@@ -18,3 +18,32 @@ MuSiQue: Question graphs (2 to 4 hops) built by assembling existing datasets.
 QAMPARI (ALCE): Complex queries derived from knowledge graphs (Wikidata/Tables), producing answers in the form of entity lists.
 
 RAGBench: Aggregation of 100k examples drawn from 5 industry sectors (legal, medical, finance, technical support, general knowledge).
+
+
+
+
+--------------------------------------------------
+
+
+
+
+**HotpotQA – Multi-hop reasoning and sentence-level evidence**
+
+**Data source:** Text corpus based on the full English Wikipedia dump (October 2017). It specifically leverages the first paragraph of each article.
+
+**Dataset construction:**
+Creation of a hyperlink graph connecting Wikipedia articles in order to target “bridge entities.”
+Questions are generated via crowdsourcing (Amazon Mechanical Turk) from pairs of connected paragraphs.
+
+**Dataset characteristics:**
+Strong supervision (supporting facts): the dataset includes the exact sentences used as evidence to produce the answer.
+
+Comparison questions: includes questions requiring comparison between two distinct entities, sometimes involving arithmetic operations or yes/no reasoning.
+
+**Key figures:**
+113,000 question–answer pairs in total.
+42% of questions require chain reasoning (inferring the first entity to find the second), and 27% are comparison questions.
+
+**Relevant / Irrelevant management:**
+The dataset includes a “Distractor” setting.
+The input context is a noisy mixture containing 2 “gold” paragraphs (true positives with relevant information), mixed with 8 distractor paragraphs (false positives retrieved using tf-idf).
