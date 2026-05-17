@@ -117,3 +117,25 @@ Extreme context lengths: ranging from 100 tokens (medical abstracts) up to 11,00
 Mixture approach: retrieval of k documents per question (e.g., 3, 4, or 10) via vector databases (FAISS), designed to bury the true relevant evidence among thematic distractors.
 
 Precision: relevant information is annotated at sentence-level granularity.
+
+
+---------------------------------------------------------
+
+**Input Contract**
+Context standardization to minimize semantic bias:
+
+ID: [n] | Paragraph: [text]
+
+Each chunk is isolated as an atomic evidence unit.
+
+**Output Contract**
+XML structuring for robust automated parsing via regex:
+
+<chunks_id>...</chunks_id>
+
+<answer>...</answer>
+
+**Business Rules (System Prompt)**
+Zero pronouns (disambiguation required)
+Full named entities required
+Mandatory full-context analysis
