@@ -97,3 +97,23 @@ Context: The model is provided with the top 100 retrieved passages (Top-100) obt
 The retriever is weak on these complex queries: DPR recall@100 is only 47.6%.
 
 Challenge: The vast majority of the 100 provided documents are false positives. The model must identify the few true positives hidden within this noise without hallucinating citations.
+
+
+
+---------------------------------
+
+**RAGBench – Multi-domain aggregation and RAG simulation**
+
+**Construction principle:** Transformation of 12 existing datasets (across 5 business domains) into a unified RAG format (Question + noisy context).
+
+**Question design:** Grounded in real-world usage. Includes actual web queries, technical forum questions, and expert-level professional requests.
+
+**Context:**
+Simulation of a real retriever: entire domain corpora (e.g., all Jeep manuals) are vectorized.
+
+Extreme context lengths: ranging from 100 tokens (medical abstracts) up to 11,000 tokens (full legal contracts).
+
+**Relevant / irrelevant management:**
+Mixture approach: retrieval of k documents per question (e.g., 3, 4, or 10) via vector databases (FAISS), designed to bury the true relevant evidence among thematic distractors.
+
+Precision: relevant information is annotated at sentence-level granularity.
