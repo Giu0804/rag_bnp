@@ -1,0 +1,20 @@
+# DIAPO 1 DATA
+
+**Title: Data Panorama: Diversity and Complexity for RAG**
+
+**Objective of the selected data:**
+Go beyond simple single-paragraph extraction (Single-hop).
+Provide corpora requiring the cross-referencing of multiple textual sources.
+
+**Structural challenges of the corpora:**
+Multi-hop reasoning: Linking facts that require connecting multiple documents together.
+Volume and density: Handling very long contexts (up to 11,000 tokens) or large document collections (Top-100 passages).
+
+**Our 4 working datasets:**
+HotpotQA: Wikipedia-based corpus (113k Q/A) focused on navigating between related concepts.
+
+MuSiQue: Question graphs (2 to 4 hops) built by assembling existing datasets.
+
+QAMPARI (ALCE): Complex queries derived from knowledge graphs (Wikidata/Tables), producing answers in the form of entity lists.
+
+RAGBench: Aggregation of 100k examples drawn from 5 industry sectors (legal, medical, finance, technical support, general knowledge).
