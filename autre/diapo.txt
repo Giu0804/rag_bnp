@@ -47,3 +47,33 @@ Comparison questions: includes questions requiring comparison between two distin
 **Relevant / Irrelevant management:**
 The dataset includes a “Distractor” setting.
 The input context is a noisy mixture containing 2 “gold” paragraphs (true positives with relevant information), mixed with 8 distractor paragraphs (false positives retrieved using tf-idf).
+
+
+
+
+-----------------------------------------------------------
+
+
+
+**MuSiQue – Connected Reasoning Graphs and Anti-Cheating Filters**
+
+**Data source:** Bottom-up approach combining 5 existing single-hop QA datasets based on Wikipedia (SQuAD, Natural Questions, MLQA, etc.).
+
+**Dataset construction:**
+Algorithmic composition of simple questions to build directed acyclic graphs (DAGs) of 2 to 4 hops.
+Human reformulation (crowdsourcing) of these graphs into fluent natural-language questions.
+
+**Dataset characteristics:**
+Decontextualized reasoning filter: mathematical removal of questions where the model can guess the answer without using intermediate documents.
+
+Unanswerable questions (MuSiQue-Full): addition of insufficient contexts to force detection of missing evidence.
+
+**Key figures:**
+~25,000 questions (MuSiQue-Ans) and ~50,000 questions (MuSiQue-Full), distributed across 6 graph structures.
+
+**Relevant / Irrelevant management:**
+Large context per question: ~20 paragraphs.
+Use of “positive distractors” (semantically very similar documents) instead of random distractors to make the task more challenging.
+
+
+
