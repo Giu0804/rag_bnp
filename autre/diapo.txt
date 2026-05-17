@@ -77,3 +77,23 @@ Use of “positive distractors” (semantically very similar documents) instead 
 
 
 
+-------------------------------------------------
+
+**QAMPARI via ALCE – Entity Lists and Retriever Stress Test**
+
+**Raw dataset (QAMPARI):**
+Source: Built from Wikidata and Wikipedia tables.
+
+Specificity: The answer is not a single value but a list of entities scattered across multiple paragraphs (e.g., “Which films feature Gong Li in the cast?”).
+
+Density: On average, 13 answers per question.
+
+**Test environment (ALCE framework):**
+Objective: Evaluate text generation with precise citations.
+
+Context: The model is provided with the top 100 retrieved passages (Top-100) obtained via a dense retrieval algorithm (DPR or GTR).
+
+**Relevant / irrelevant management (noise challenge):**
+The retriever is weak on these complex queries: DPR recall@100 is only 47.6%.
+
+Challenge: The vast majority of the 100 provided documents are false positives. The model must identify the few true positives hidden within this noise without hallucinating citations.
