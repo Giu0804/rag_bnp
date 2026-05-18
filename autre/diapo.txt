@@ -160,3 +160,23 @@ $$A = \begin{cases} 1 & \text{si } TP = |S_{gold}| \text{ et } FP = 0 \\ 0 & \te
 
 
 $$F_1 = 2 \cdot \frac{Precision \cdot Recall}{Precision + Recall}$$
+
+
+
+
+
+A = \cases{
+1 & \mathrm{si}\ TP = |S_{gold}| \ \mathrm{et}\ FP = 0 \cr
+0 & \mathrm{sinon}
+}
+
+
+
+A=\left\{
+\begin{array}{ll}
+1 & \mathrm{si}\ TP=|S_{gold}| \ \mathrm{et}\ FP=0 \\
+0 & \mathrm{sinon}
+\end{array}
+\right.
+
+
