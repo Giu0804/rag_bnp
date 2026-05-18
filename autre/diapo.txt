@@ -249,3 +249,23 @@ In long but relatively clean contexts, *Cite-then-Answer* acts as an effective a
 ### QAMPARI (High-Noise Stress Test)
 
 Under heavy retrieval noise, *Cite-then-Answer* tends to inflate recall by citing many weakly related sources. In contrast, *Answer-then-Cite* allows the model to filter irrelevant information before producing justifications.
+
+
+
+
+
+
+------------------------------
+
+### Stability of Large Architectures
+
+Large models (70B and 27B) maintain a consistently high true positive rate regardless of task ordering.
+
+### Overload in Compact Models
+
+The 8B model shows a drop in F1 score under the *Cite-then-Answer* setting. The syntactic complexity of citation generation negatively affects its ability to produce accurate responses.
+
+### Metric Trade-off
+
+* **Green (CTA):** Maximizes recall by extracting as many relevant sources as possible.
+* **Blue (ATC):** Maximizes precision by focusing on the most direct and accurate answer.
