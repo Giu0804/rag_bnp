@@ -180,3 +180,51 @@ A=\left\{
 \right.
 
 
+
+
+-------------------------------------------
+
+
+FACTUM
+
+### Mechanistic Signals Extracted During Citation Generation
+
+At the exact moment the model generates a citation token, four continuous mechanistic signals are extracted:
+
+* **CAS (Contextual Alignment Score)**
+  Measures how strongly the citation is semantically aligned with the retrieved evidence using cosine similarity between the citation state and the contextual representation.
+
+* **BAS (Beginning-of-Sentence Attention Score)**
+  Measures attention allocated to the first token (`<s>`), interpreted as an internal aggregation point for information synthesis.
+
+* **PFS (Parametric Force Score)**
+  Quantifies the strength of the model’s internal factual memory by measuring the FFN contribution magnitude in the residual stream.
+
+* **PAS (Pathway Alignment Score)**
+  Measures alignment between Attention and FFN updates.
+
+  * **+1** → collaboration
+  * **0** → independence
+  * **−1** → contradiction between retrieval and parametric memory.
+
+
+
+----------------- 
+contextCite
+### White-Box Attribution (Macro Level): Surrogate Modeling with ContextCite
+
+#### Core Idea: Contribution-Based Attribution via Ablation
+
+* **Goal:** Identify which sources *caused* a generated statement, not just those that support it afterward.
+* **Method:** Measure changes in output logit probabilities when different context sources are masked (ablated).
+
+#### Mathematical Pipeline (3 Steps)
+
+1. **Sampling**
+   Generate random ablation masks over context documents and compute the response probability for each mask.
+
+2. **Linear Regression (LASSO)**
+   Train a sparse surrogate linear model to predict logit probabilities from the ablation masks.
+
+3. **Attribution Extraction**
+   The learned regression weights become direct source attribution scores.
