@@ -228,3 +228,24 @@ contextCite
 
 3. **Attribution Extraction**
    The learned regression weights become direct source attribution scores.
+
+
+
+
+---------------------------------------------------
+
+### Musique (Specialized Knowledge)
+
+For large models such as Qwen and Llama 70B, generation order has limited impact. However, smaller models become significantly more reliable with the *Answer-then-Cite* strategy, especially when dealing with niche or specialized information.
+
+### HotpotQA (Multi-Hop Reasoning)
+
+On complex reasoning tasks, *Answer-then-Cite* consistently performs better. Requiring citations before reasoning increases attention load and can substantially reduce overall accuracy.
+
+### RAGBench (Enterprise-Style Retrieval)
+
+In long but relatively clean contexts, *Cite-then-Answer* acts as an effective attention filter. Selecting sources first helps models focus on relevant evidence and improves response grounding.
+
+### QAMPARI (High-Noise Stress Test)
+
+Under heavy retrieval noise, *Cite-then-Answer* tends to inflate recall by citing many weakly related sources. In contrast, *Answer-then-Cite* allows the model to filter irrelevant information before producing justifications.
