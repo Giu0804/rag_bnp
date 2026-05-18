@@ -139,3 +139,10 @@ XML structuring for robust automated parsing via regex:
 Zero pronouns (disambiguation required)
 Full named entities required
 Mandatory full-context analysis
+
+
+
+
+----------------------------------------
+
+$$P = \frac{TP}{TP + FP}$$
