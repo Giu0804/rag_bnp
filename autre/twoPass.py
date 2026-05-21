@@ -724,3 +724,16 @@ df_citations, metrics_citations = cite_generated_answers(
     output_filename="pass2_citations.csv"
 )
 """
+
+
+
+
+
+model = Mistral3ForConditionalGeneration.from_pretrained(
+    model_path,
+    device_map="auto",
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_use_double_quant=True
+)
