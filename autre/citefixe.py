@@ -311,3 +311,113 @@ def execute_citefix_laboratory(parquet_input_path: str, alpha_grid: List[float] 
 # exemple
 
 summary_table = execute_citefix_laboratory("mes_resultats.parquet")
+
+
+
+
+
+
+
+
+
+
+
+# NLI 
+
+import re
+import pandas as pd
+import torch
+from transformers import pipeline
+
+# ==========================================
+# 1. INITIALISATION DU NLI JUDGE (BART)
+# ==========================================
+nli_judge = pipeline(
+    "text-classification",
+    model="facebook/bart-large-mnli",
+    device=0
+)
+
+def scan_context_with_nli_atomic(atomic_facts_list, context_list, threshold=0.6):
+    """
+    Vérifie si les chunks impliquent (entail) les faits atomiques.
+    """
+    predicted_ids = set()
+
+    if not atomic_facts_list:
+        return []
+
+    for fact in atomic_facts_list:
+        # On crée les paires [Chunk, Fait Atomique]
+        pairs = [{"text": chunk['text'], "text_pair": fact} for chunk in context_list]
+
+        # Inférence BART (on ajoute batch_size pour que ce soit très rapide)
+        results = nli_judge(pairs, top_k=None, batch_size=32)
+
+        for chunk, chunk_scores in zip(context_list, results):
+            for score_dict in chunk_scores:
+                if 'ENTAIL' in str(score_dict['label']).upper() and score_dict['score'] >= threshold:
+                    predicted_ids.add(chunk['id'])
+                    break 
+
+    return list(predicted_ids)
+
+# ==========================================
+# 2. CHARGEMENT DE TON DATASET PARQUET
+# ==========================================
+# On charge le fichier généré par l'étape d'inférence précédente
+df_saved = pd.read_parquet("ton_dataset_genere.parquet")
+
+results_nli = []
+
+# ==========================================
+# 3. BOUCLE D'ÉVALUATION UNIQUEMENT
+# ==========================================
+for index, row in df_saved.iterrows():
+
+    # --- ÉTAPE A : EXTRACTION DES FAITS ATOMIQUES (SANS LLM) ---
+    # On découpe simplement le texte stocké grâce à tes tirets "-"
+    raw_answer = row["generated_answer"]
+    atomic_facts = [fact.strip("- *").strip() for fact in raw_answer.split('\n') if fact.strip() and fact.strip().startswith('-')]
+
+    # Sécurité si une ligne n'a pas de tiret
+    if not atomic_facts:
+        atomic_facts = [fact.strip() for fact in raw_answer.split('\n') if fact.strip()]
+
+    # --- ÉTAPE B : ÉVALUATION NLI AVEC BART ---
+    pred_ids = scan_context_with_nli_atomic(atomic_facts, row["contexts"], threshold=0.6)
+
+    # --- ÉTAPE C : METRICS (Ton code exact) ---
+    gold_set = set(row["gold_ids"])
+    pred_set = set(pred_ids)
+
+    correct_ids = pred_set.intersection(gold_set)
+
+    p = len(correct_ids) / len(pred_set) if pred_set else 0
+    r = len(correct_ids) / len(gold_set) if gold_set else 0
+    em = 1 if pred_set == gold_set else 0
+
+    results_nli.append({"p": p, "r": r, "em": em})
+
+    # --- AFFICHAGE ---
+    print(f"--- SAMPLE {index + 1} ---")
+    print(f"Q: {row['question']}")
+    print(f"A (Stockée): {raw_answer}")
+    print("Faits Atomiques extraits :")
+    for f in atomic_facts:
+        print(f"  - {f}")
+    print(f"Gold IDs: {row['gold_ids']}")
+    print(f"NLI Pred IDs: {pred_ids}")
+    print(f"Verdict: {'✅' if em else '❌'} (P: {p:.2f}, R: {r:.2f})")
+    print("-" * 30)
+
+# ==========================================
+# 4. BILAN FINAL (Ton code exact)
+# ==========================================
+total = len(results_nli)
+print("\n" + "=" * 40)
+print(f"BILAN FINAL NLI-SCAN ATOMIQUE BART ({total} SAMPLES)")
+print("=" * 40)
+print(f"Précision moyenne : {sum(m['p'] for m in results_nli) / total:.2%}")
+print(f"Rappel moyen      : {sum(m['r'] for m in results_nli) / total:.2%}")
+print(f"Exact Match Total : {sum(m['em'] for m in results_nli) / total:.2%}")
