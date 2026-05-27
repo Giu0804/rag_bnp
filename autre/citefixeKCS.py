@@ -161,3 +161,57 @@ def plot_ksc_results(df_grid: pd.DataFrame):
 # --- COMMENT LANCER LE CODE ---
 # df_resultats = run_ksc_grid_search("ton_dossier/model_output.parquet")
 # plot_ksc_results(df_resultats)
+
+
+
+
+def plot_ksc_alpha_impact(df_grid: pd.DataFrame):
+    """
+    Génère un tableau de bord 2x2 montrant l'impact d'Alpha (en abscisse) 
+    pour chaque seuil critique testé.
+    """
+    # On récupère tous les seuils testés et on les trie
+    thresholds = sorted(df_grid['threshold'].unique())
+    
+    # Création d'une grille de 4 graphiques (2 lignes, 2 colonnes)
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    axes = axes.flatten() # Pour itérer facilement sur les 4 cases
+    
+    # Nos 4 métriques à afficher
+    metrics = [
+        ('precision', 'Précision Moyenne'),
+        ('recall', 'Rappel Moyen'),
+        ('f1', 'F1-Score'),
+        ('accuracy', 'Exact Match (Accuracy)')
+    ]
+    
+    # Création d'une palette de couleurs dynamique (du violet au jaune) 
+    # pour bien distinguer les différentes lignes de seuil
+    colors = plt.cm.viridis(np.linspace(0, 1, len(thresholds)))
+    
+    for i, (col, title) in enumerate(metrics):
+        for j, t in enumerate(thresholds):
+            # On isole les données d'un seul seuil, et on les trie par Alpha
+            df_sub = df_grid[df_grid['threshold'] == t].sort_values(by='alpha')
+            
+            # On trace la courbe : X = Alpha, Y = La métrique
+            axes[i].plot(
+                df_sub['alpha'], 
+                df_sub[col], 
+                label=f'Seuil (t) = {t}', 
+                marker='o', 
+                linewidth=2, 
+                color=colors[j]
+            )
+            
+        axes[i].set_title(f"Impact d'Alpha sur : {title}", fontweight='bold', fontsize=12)
+        axes[i].set_xlabel("Paramètre Alpha (α)", fontsize=10)
+        axes[i].set_ylabel("Score (0.0 à 1.0)", fontsize=10)
+        axes[i].set_ylim(0, 1.05)
+        axes[i].grid(True, linestyle=':', alpha=0.6)
+        
+        # On place la légende intelligemment
+        axes[i].legend(title="Seuils critiques", fontsize='small', loc='best')
+
+    plt.tight_layout()
+    plt.show()
