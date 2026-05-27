@@ -1,0 +1,72 @@
+Vous avez tout à fait raison de me reprendre, et je comprends votre agacement. Mon approche initiale était trop vulgarisée, et vous cherchez une véritable fiche de lecture technique de l'article de recherche. C'est légitime.
+
+Faisons les choses correctement. Voici l'analyse détaillée, exhaustive et technique du papier **"FinGround: Detecting and Grounding Financial Hallucinations via Atomic Claim Verification"** (Guo, Wu, Yiu — Avril 2026, ACL Industry Track).
+
+---
+
+### 1. Fondations Théoriques et Problème Ciblé
+
+Le papier part d'un constat empirique et théorique fort : **les méthodes de détection d'hallucinations existantes (basées sur la NLI - Natural Language Inference) échouent massivement dans les domaines quantitatifs.** * **L'angle mort de la NLI :** Les détecteurs classiques traitent toutes les affirmations de la même manière. Les auteurs démontrent que cette approche uniforme **rate 43 % des erreurs de calcul** (*computational errors*). Un modèle de langage est capable de voir que les mots "chiffre d'affaires" et "bénéfice" sont dans le texte source, mais il valide à tort des ratios financiers mathématiquement faux.
+
+* **Enjeu réglementaire :** Ce papier a été pensé pour répondre directement aux exigences strictes de conformité liées à l'entrée en vigueur de l'**EU AI Act** (pour les systèmes à haut risque, avec une échéance citée à août 2026).
+
+---
+
+### 2. L'Architecture Technique (Le Pipeline en 3 Étapes)
+
+FinGround n'est pas un simple "prompt". C'est un pipeline déterministe et hybride (*Verify-then-Ground*), conçu pour sécuriser les systèmes RAG (Retrieval-Augmented Generation) en trois étapes distinctes :
+
+#### Étape 1 : Finance-Aware Hybrid Retrieval
+
+Le système ne se contente pas d'extraire des paragraphes de texte (*chunks*). Il opère une recherche hybride capable de parser conjointement le texte brut et la **structure multidimensionnelle des tableaux financiers** (les rapports annuels étant souvent des labyrinthes de tables imbriquées).
+
+#### Étape 2 : Atomic Verification et Routage Taxonomique (Le cœur du papier)
+
+C'est la principale innovation technique. La réponse du LLM est décomposée en affirmations atomiques, qui sont ensuite classifiées dans une **taxonomie de 6 types** validée par les auteurs :
+
+1. Numérique
+2. Temporelle
+3. Entité-Attribut
+4. Comparative
+5. Réglementaire
+6. **Computationnelle (Calculs)**
+
+Le pipeline applique alors une stratégie de **vérification routée par type** :
+
+* **Pour les types 1 à 5 :** Utilisation d'un modèle NLI spécialisé pour l'alignement sémantique avec la source.
+* **Pour le type 6 (Computationnelle) :** La NLI est totalement désactivée. FinGround utilise une méthode de **Reconstruction de Formules** en trois sous-étapes :
+1. Le système identifie la formule mathématique implicite en la mappant contre une bibliothèque embarquée de **47 modèles de formules financières** (templates).
+2. Il extrait les opérandes (les vrais chiffres) directement depuis les cellules des tableaux sources.
+3. Il lance un recalcul algorithmique strict avec une tolérance de **±0,5 %** (pour gérer exclusivement les arrondis acceptables).
+
+
+
+#### Étape 3 : Grounded Regeneration
+
+Si une affirmation est fausse ou non supportée, elle est envoyée en réécriture. Le système force le modèle à produire des citations d'une granularité extrême : les ancrages se font au niveau du paragraphe, mais aussi au niveau de la **cellule de tableau exacte** (*table-cell-level citations*).
+
+---
+
+### 3. Les Modèles Utilisés et la Stratégie de Distillation
+
+Le papier détaille une approche à deux vitesses pour concilier performance absolue et viabilité industrielle :
+
+* **Le modèle Teacher (Construction et Baseline) :** **GPT-4o**. Il est utilisé pour le pipeline initial et pour générer les données de supervision complexes. Le pipeline complet avec GPT-4o réduit les hallucinations de **78 %** par rapport à une utilisation de GPT-4o nu.
+* **Le modèle Student (Déploiement) :** Les auteurs ont distillé les capacités de détection dans un LLM beaucoup plus petit de **8 Milliards de paramètres (8B)**.
+* **Performances :** Ce modèle 8B conserve **91,4 %** du score F1 du grand modèle sur la tâche stricte de vérification.
+* **Efficience :** La latence par affirmation est divisée par 18.
+* **Coût :** Le coût de déploiement s'effondre à **0,003 $ par requête**.
+
+
+
+---
+
+### 4. Données, Baselines et Nouvelle Méthodologie d'Évaluation
+
+Au-delà de la méthode, les auteurs proposent un nouveau standard pour la recherche sur les RAG :
+
+* **Les Datasets :** L'évaluation s'appuie massivement sur des benchmarks quantitatifs difficiles comme **FinQA** (un dataset complexe nécessitant l'extraction de tableaux financiers et des calculs multi-étapes).
+* **La contribution méthodologique (Retrieval-Equalized Evaluation) :** Dans la littérature, il est souvent difficile de savoir si un système RAG est meilleur parce qu'il cherche mieux l'information ou parce qu'il hallucine moins. Les auteurs imposent une évaluation "à récupération égale" : toutes les baselines reçoivent *exactement le même contexte sourcé*.
+* **Résultats bruts :** Dans ce cadre strictement contrôlé (où la qualité du moteur de recherche ne joue plus), la composante de vérification atomique de FinGround à elle seule permet une réduction supplémentaire du taux d'hallucination de **68 à 76 %** par rapport aux meilleures baselines existantes (avec une pertinence statistique de p < 0.01).
+
+**En conclusion pour votre application industrielle :** La vraie valeur de ce papier réside dans sa taxonomie à 6 classes couplée à la reconstruction algorithmique des formules (pour pallier les faiblesses du LLM en calcul), ainsi que la viabilité économique de son modèle distillé à 8B, validé d'ailleurs par les auteurs lors d'un pilote en conditions réelles de 4 semaines avec des analystes financiers.
