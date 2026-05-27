@@ -215,3 +215,48 @@ def plot_ksc_alpha_impact(df_grid: pd.DataFrame):
 
     plt.tight_layout()
     plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+def plot_ksc_alpha_impact(df_grid: pd.DataFrame):
+    """
+    Génère un graphique par Seuil (t).
+    Sur chaque graphique, toutes les métriques évoluent en fonction d'Alpha (X).
+    """
+    # On récupère la liste des seuils testés
+    thresholds = sorted(df_grid['threshold'].unique())
+    
+    # On crée une figure verticale (un bloc par seuil)
+    plt.figure(figsize=(10, 5 * len(thresholds)))
+    
+    for i, t in enumerate(thresholds):
+        # On filtre les données pour ne garder que le seuil actuel et on trie par Alpha
+        df_sub = df_grid[df_grid['threshold'] == t].sort_values(by='alpha')
+        
+        plt.subplot(len(thresholds), 1, i + 1)
+        
+        # On trace TOUTES les métriques sur le MÊME graphique
+        plt.plot(df_sub['alpha'], df_sub['precision'], label='Précision', marker='o', color='#2ca02c', lw=2)
+        plt.plot(df_sub['alpha'], df_sub['recall'], label='Rappel', marker='x', color='#d62728', lw=2)
+        plt.plot(df_sub['alpha'], df_sub['f1'], label='F1-Score', linestyle='--', color='#7f7f7f', lw=2)
+        plt.plot(df_sub['alpha'], df_sub['accuracy'], label='Exact Match (Acc)', marker='s', color='#1f77b4', lw=2)
+        
+        plt.title(f"Impact d'Alpha pour le Seuil constant (t) = {t}", fontweight='bold')
+        plt.xlabel("Paramètre Alpha (α)")
+        plt.ylabel("Score")
+        plt.ylim(0, 1.05)
+        plt.xlim(df_grid['alpha'].min() - 0.05, df_grid['alpha'].max() + 0.05)
+        plt.grid(True, linestyle=':', alpha=0.7)
+        plt.legend(loc='lower left')
+        
+    plt.tight_layout()
+    plt.show()
