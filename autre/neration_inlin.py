@@ -235,3 +235,70 @@ def parse_inline_atomic(full_generation):
         "pred_ids": pred_ids,
         "atomic_claims": atomic_claims_str
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def parse_inline_atomic(full_generation):
+    """
+    Analyse la génération brute pour extraire la raw_output, clean_output, 
+    les pred_ids uniques et les atomic_claims (gère le format liste <chunk_id>X, Y</chunk_id>).
+    """
+    # 1. Isolation de la balise <answer>
+    answer_match = re.search(r'<answer>(.*?)</answer>', full_generation, re.DOTALL)
+    raw_output = answer_match.group(1).strip() if answer_match else full_generation.strip()
+        
+    # 2. Vérification de la présence de balises chunk_id
+    has_chunks = bool(re.search(r'<chunk_id>.*?</chunk_id>', raw_output))
+    
+    atomic_claims_list = []
+    pred_ids_all = []
+    
+    if has_chunks:
+        # Découpage : cherche des morceaux de texte se terminant par une balise chunk_id
+        raw_claims = re.findall(r'(.*?<chunk_id>.*?</chunk_id>\.?)', raw_output)
+        for claim in raw_claims:
+            # Extraction de la chaîne de caractères à l'intérieur des balises (ex: "14, 2")
+            id_string_match = re.search(r'<chunk_id>(.*?)</chunk_id>', claim)
+            if id_string_match:
+                # On extrait tous les nombres présents dans cette chaîne
+                ids_in_claim = re.findall(r'\d+', id_string_match.group(1))
+                for chunk_id in ids_in_claim:
+                    pred_ids_all.append(int(chunk_id))
+                    
+            # Nettoyage du claim pour enlever la balise chunk_id de la phrase
+            clean_claim = re.sub(r'<chunk_id>.*?</chunk_id>', '', claim).strip().strip('.')
+            if clean_claim:
+                atomic_claims_list.append(f"- {clean_claim}")
+    else:
+        # CAS SANS AUCUN CHUNK_ID : Découpage classique par les points finaux (.)
+        sentences = re.split(r'\.(?=\s|$)', raw_output)
+        for sentence in sentences:
+            clean_sentence = sentence.strip()
+            if clean_sentence:
+                atomic_claims_list.append(f"- {clean_sentence}")
+                
+    atomic_claims_str = "\n".join(atomic_claims_list)
+    
+    # 3. Suppression des doublons d'IDs globaux en préservant l'ordre d'apparition
+    pred_ids = list(dict.fromkeys(pred_ids_all))
+    
+    # 4. Nettoyage de la réponse texte globale (clean_output)
+    clean_answer = re.sub(r'\s*<chunk_id>.*?</chunk_id>', '', raw_output)
+    clean_answer = re.sub(r'\s+\.', '.', clean_answer)
