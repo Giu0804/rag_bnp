@@ -167,3 +167,71 @@ def evaluate_strategy(dataset, model_name, generate_ll):
     print(f"DataFrame exporté avec succès vers le fichier : {output_filename}")
     
     return df_final
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def parse_inline_atomic(full_generation):
+    """
+    Analyse la génération brute pour extraire la raw_output, clean_output, 
+    les pred_ids uniques et les atomic_claims (gère l'absence totale de chunk_id).
+    """
+    # 1. Isolation de la balise <answer>
+    answer_match = re.search(r'<answer>(.*?)</answer>', full_generation, re.DOTALL)
+    raw_output = answer_match.group(1).strip() if answer_match else full_generation.strip()
+        
+    # 2. Vérification de la présence de balises chunk_id
+    has_chunks = bool(re.search(r'<chunk_id>\d+</chunk_id>', raw_output))
+    
+    atomic_claims_list = []
+    pred_ids_all = []
+    
+    if has_chunks:
+        # Découpage classique par balise(s)
+        raw_claims = re.findall(r'(.*?(?:<chunk_id>\d+</chunk_id>)+\.?)', raw_output)
+        for claim in raw_claims:
+            ids_in_claim = re.findall(r'<chunk_id>(\d+)</chunk_id>', claim)
+            for chunk_id in ids_in_claim:
+                pred_ids_all.append(int(chunk_id))
+                
+            clean_claim = re.sub(r'<chunk_id>\d+</chunk_id>', '', claim).strip().strip('.')
+            if clean_claim:
+                atomic_claims_list.append(f"- {clean_claim}")
+    else:
+        # CAS SANS AUCUN CHUNK_ID : Découpage par les points finaux (.)
+        # On sépare le texte à chaque phrase pour garder la structure atomique
+        sentences = re.split(r'\.(?=\s|$)', raw_output)
+        for sentence in sentences:
+            clean_sentence = sentence.strip()
+            if clean_sentence:
+                atomic_claims_list.append(f"- {clean_sentence}")
+                
+    atomic_claims_str = "\n".join(atomic_claims_list)
+    
+    # 3. Suppression des doublons d'IDs en gardant l'ordre
+    pred_ids = list(dict.fromkeys(pred_ids_all))
+    
+    # 4. Nettoyage de la réponse texte globale (clean_output)
+    clean_answer = re.sub(r'\s*<chunk_id>\d+</chunk_id>', '', raw_output)
+    clean_answer = re.sub(r'\s+\.', '.', clean_answer)
+    
+    return {
+        "raw_output": raw_output,
+        "clean_output": clean_answer,
+        "pred_ids": pred_ids,
+        "atomic_claims": atomic_claims_str
+    }
