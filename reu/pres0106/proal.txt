@@ -1,0 +1,5 @@
+$\lambda$ (Lambda) 
+
+$f_{keyword}(x_{i},\hat{x}_{j})$
+
+$r(q,\hat{x}_{j})$ 
