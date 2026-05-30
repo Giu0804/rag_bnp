@@ -3,3 +3,14 @@ $\lambda$ (Lambda)
 $f_{keyword}(x_{i},\hat{x}_{j})$
 
 $r(q,\hat{x}_{j})$ 
+
+$\frac{|A \cap B|}{|A \cup B|}$
+
+
+Le Jaccard d'ancrage du fait : $J_{fact}(x_{i},\hat{x}_{j}) = \frac{|x_{i} \cap \hat{x}_{j}|}{|x_{i} \cup \hat{x}_{j}|}$
+
+Le Jaccard de pertinence de la question = J_{question}(q,\hat{x}_{j}) = \frac{|q \cap \hat{x}_{j}|}{|q \cup \hat{x}_{j}|}$
+
+
+
+$f(x_{i},\hat{x}_{j}) = \lambda \cdot J_{fact}(x_{i},\hat{x}_{j}) + (1-\lambda) \cdot J_{question}(q,\hat{x}_{j})$  
