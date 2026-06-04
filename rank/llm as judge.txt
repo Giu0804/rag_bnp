@@ -40,3 +40,61 @@ def run_evaluation_pipeline(file_path, output_path, evaluator):
     
     print(f"Évaluation terminée. Fichier sauvegardé : {output_path}")
     return df_final
+
+
+
+
+
+
+
+
+
+
+import pandas as pd
+from deepeval.test_case import LLMTestCase
+
+def run_evaluation_pipeline(file_path, output_path, evaluator):
+    # 1. Chargement
+    df = pd.read_parquet(file_path)
+    
+    # 2. Préparation
+    test_cases = [
+        LLMTestCase(
+            input=row['question'],
+            actual_output=row['generated_answer'],
+            retrieval_context=[item['text'] for item in row['context']],
+            context=[item['text'] for item in row['context'] if item['id'] in row['gold_ids']]
+        ) for _, row in df.iterrows()
+    ]
+
+    # 3. Évaluation
+    # 'res' est ton EvaluationsAndReport
+    res = evaluator.evaluate(test_cases)
+    
+    # --- Ton affichage habituel pour le debug ---
+    # C'est ici que tu vois tout le détail dans le notebook
+    print(res) 
+    
+    # 4. Sauvegarde des scores
+    # On récupère le report qui contient les scores finaux
+    final_report = res.report
+    
+    # On crée une ligne avec les scores globaux
+    # (Remplace les noms d'attributs par ceux que tu utilises d'habitude)
+    scores_data = {
+        "answer_relevancy": final_report.answer_relevancy_score,
+        "completeness": final_report.completeness_score,
+        "faithfulness": final_report.faithfulness_score
+    }
+    
+    # 5. Fusion
+    # Comme c'est un rapport global, on ajoute ces colonnes à tout ton dataframe
+    df_final = df.copy()
+    for col, value in scores_data.items():
+        df_final[col] = value
+    
+    # 6. Sauvegarde
+    df_final.to_parquet(output_path)
+    print(f"Évaluation terminée. Scores globaux ajoutés et sauvegardés dans : {output_path}")
+    
+    return df_final
