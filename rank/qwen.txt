@@ -1,0 +1,112 @@
+import torch
+import pandas as pd
+import json
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from tqdm import tqdm
+
+# --- 1. CONFIGURATION & CHARGEMENT ---
+# Utilisation du modèle 4B spécifiquement
+model_path = "Qwen/Qwen3-Reranker-4B"
+tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side='left')
+model = AutoModelForCausalLM.from_pretrained(
+    model_path, 
+    torch_dtype=torch.float16, 
+    device_map="auto"
+).eval()
+
+token_false_id = tokenizer.convert_tokens_to_ids("no")
+token_true_id = tokenizer.convert_tokens_to_ids("yes")
+max_length = 8192
+
+prefix = "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n"
+suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
+suffix_tokens = tokenizer.encode(suffix, add_special_tokens=False)
+
+# --- 2. FONCTIONS DE TRAITEMENT ---
+def format_instruction(query, doc):
+    instruction = 'Given a web search query, retrieve relevant passages that answer the query'
+    return "<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {doc}".format(
+        instruction=instruction, query=query, doc=doc
+    )
+
+def process_inputs(pairs):
+    inputs = tokenizer(
+        pairs, padding=False, truncation='longest_first',
+        return_attention_mask=False, max_length=max_length - len(prefix_tokens) - len(suffix_tokens)
+    )
+    for i, ele in enumerate(inputs['input_ids']):
+        inputs['input_ids'][i] = prefix_tokens + ele + suffix_tokens
+    inputs = tokenizer.pad(inputs, padding=True, return_tensors="pt", max_length=max_length)
+    return {k: v.to(model.device) for k, v in inputs.items()}
+
+@torch.no_grad()
+def compute_scores(pairs, batch_size=4):
+    all_scores = []
+    for i in range(0, len(pairs), batch_size):
+        batch_pairs = pairs[i : i + batch_size]
+        inputs = process_inputs(batch_pairs)
+        batch_scores = model(**inputs).logits[:, -1, :]
+        true_vector = batch_scores[:, token_true_id]
+        false_vector = batch_scores[:, token_false_id]
+        probs = torch.softmax(torch.stack([false_vector, true_vector], dim=1), dim=1)
+        all_scores.extend(probs[:, 1].tolist())
+    return all_scores
+
+def process_dataframe(df):
+    """
+    Parcourt le dataframe, appelle le reranker et met à jour 'contexts'
+    avec la clé 'score'. Aucun tri n'est appliqué ici.
+    """
+    new_rows = []
+    
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Reranking"):
+        query = row['question']
+        contexts = row['contexts'] # Liste de dict : {"id": ..., "text": ...}
+        
+        # Préparation des prompts pour tous les contextes de cette query
+        pairs = [format_instruction(query, ctx['text']) for ctx in contexts]
+        
+        # Calcul des scores
+        scores = compute_scores(pairs)
+        
+        # Création des nouveaux triplets
+        new_contexts = []
+        for ctx, score in zip(contexts, scores):
+            new_ctx = {
+                "id": ctx["id"],
+                "text": ctx["text"],
+                "score": float(score)
+            }
+            new_contexts.append(new_ctx)
+            
+        # Construction de la nouvelle ligne
+        new_row = row.to_dict()
+        new_row['contexts'] = new_contexts
+        new_rows.append(new_row)
+        
+    return pd.DataFrame(new_rows)
+
+def save_to_json(df, filename):
+    # Sauvegarde du dataframe au format orienté records (liste d'objets)
+    df.to_json(filename, orient='records', indent=4, force_ascii=False)
+    print(f"Dataset enrichi sauvegardé dans : {filename}")
+
+# --- 3. EXÉCUTION ---
+if __name__ == "__main__":
+    # Exemple de structure de ton DataFrame actuel
+    df = pd.DataFrame([
+        {
+            "id": "q1",
+            "question": "Quelle est la capitale de la France ?",
+            "contexts": [{"id": 1, "text": "Paris est la capitale."}, {"id": 2, "text": "Lyon est une ville."}],
+            "gold_ids": [1],
+            "answer": "Paris"
+        }
+    ])
+    
+    # Lancement du processus
+    df_result = process_dataframe(df)
+    
+    # Sauvegarde
+    save_to_json(df_result, "dataset_enriched_4B.json")
