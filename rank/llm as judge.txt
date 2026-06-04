@@ -1,0 +1,42 @@
+def run_evaluation_pipeline(file_path, output_path, evaluator):
+    # 1. Chargement et préparation (comme avant)
+    df = pd.read_parquet(file_path)
+    test_cases = [
+        LLMTestCase(
+            name=str(row['id']),
+            input=row['question'],
+            actual_output=row['generated_answer'],
+            retrieval_context=[item['text'] for item in row['context']],
+            context=[item['text'] for item in row['context'] if item['id'] in row['gold_ids']]
+        ) for _, row in df.iterrows()
+    ]
+
+    # 2. Évaluation
+    # On récupère l'objet complet
+    res = evaluator.evaluate(test_cases)
+    
+    # 3. Affichage adaptatif et extraction simultanée
+    scores_data = []
+    
+    print(f"--- Début de l'évaluation de {len(res.evaluations)} samples ---\n")
+    
+    for i, eval_obj in enumerate(res.evaluations):
+        # A. Affichage adaptatif (sample par sample)
+        print(f"--- Sample {i+1} (ID: {eval_obj.id}) ---")
+        print(eval_obj)  # Affiche tout le détail verbeux du sample
+        print("-" * 30 + "\n")
+        
+        # B. Extraction propre des scores pour la sauvegarde
+        scores_data.append({
+            "answer_relevancy": eval_obj.answer_relevancy_score,
+            "completeness": eval_obj.completeness_score,
+            "faithfulness": eval_obj.faithfulness_score
+        })
+    
+    # 4. Sauvegarde finale
+    df_scores = pd.DataFrame(scores_data)
+    df_final = pd.concat([df.reset_index(drop=True), df_scores], axis=1)
+    df_final.to_parquet(output_path)
+    
+    print(f"Évaluation terminée. Fichier sauvegardé : {output_path}")
+    return df_final
