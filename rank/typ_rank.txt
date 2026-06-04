@@ -1,0 +1,50 @@
+def get_top_k_best(df, k):
+    df_new = df.copy()
+    df_new['contexts'] = df_new['contexts'].apply(lambda x: sorted(x, key=lambda c: c['score'], reverse=True)[:k])
+    return df_new
+
+def get_top_k_random(df, k):
+    df_new = df.copy()
+    df_new['contexts'] = df_new['contexts'].apply(lambda x: random.sample(x, min(k, len(x))))
+    return df_new
+
+def get_top_k_less(df, k):
+    df_new = df.copy()
+    df_new['contexts'] = df_new['contexts'].apply(lambda x: sorted(x, key=lambda c: c['score'])[:k])
+    return df_new
+
+
+
+def _gold_plus_strategy(df, k, strategy):
+    df_new = df.copy()
+    def process(row):
+        golds = [c for c in row['contexts'] if c['id'] in row['gold_ids']]
+        dist = [c for c in row['contexts'] if c['id'] not in row['gold_ids']]
+        if strategy == "best": dist = sorted(dist, key=lambda x: x['score'], reverse=True)
+        elif strategy == "less": dist = sorted(dist, key=lambda x: x['score'])
+        else: random.shuffle(dist)
+        return (golds + dist)[:k]
+    df_new['contexts'] = df_new.apply(process, axis=1)
+    return df_new
+
+def get_gold_plus_best(df, k): return _gold_plus_strategy(df, k, "best")
+def get_gold_plus_random(df, k): return _gold_plus_strategy(df, k, "random")
+def get_gold_plus_less(df, k): return _gold_plus_strategy(df, k, "less")
+
+
+
+def _k_gold_m_strategy(df, k_gold, k_dist, strategy):
+    df_new = df.copy()
+    def process(row):
+        golds = [c for c in row['contexts'] if c['id'] in row['gold_ids']]
+        dist = [c for c in row['contexts'] if c['id'] not in row['gold_ids']]
+        if strategy == "best": dist = sorted(dist, key=lambda x: x['score'], reverse=True)
+        elif strategy == "less": dist = sorted(dist, key=lambda x: x['score'])
+        else: random.shuffle(dist)
+        return golds[:k_gold] + dist[:k_dist]
+    df_new['contexts'] = df_new.apply(process, axis=1)
+    return df_new
+
+def get_k_gold_m_best(df, k_gold, k_dist): return _k_gold_m_strategy(df, k_gold, k_dist, "best")
+def get_k_gold_m_random(df, k_gold, k_dist): return _k_gold_m_strategy(df, k_gold, k_dist, "random")
+def get_k_gold_m_less(df, k_gold, k_dist): return _k_gold_m_strategy(df, k_gold, k_dist, "less")
