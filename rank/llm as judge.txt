@@ -118,3 +118,67 @@ test = LLMTestCase(
     contexts=[item['text'] for item in row['context'] if item['id'] in row['gold_ids']]
 )
 print(test.contexts) # Si ça affiche une liste vide, c'est là qu'est le bug
+
+
+
+
+
+
+
+
+
+
+
+
+
+import pandas as pd
+from deepeval.test_case import LLMTestCase
+
+def run_evaluation_pipeline(file_path, output_path, evaluator):
+    # 1. Chargement
+    df = pd.read_parquet(file_path)
+    print(f"Dataset chargé avec {len(df)} lignes.")
+    
+    # 2. Préparation des test_cases (ON CRÉE BIEN UNE LISTE D'OBJETS)
+    test_cases = []
+    for _, row in df.iterrows():
+        # Création de l'objet pour LA ligne en cours
+        tc = LLMTestCase(
+            input=row['question'],
+            actual_output=row['generated_answer'],
+            retrieval_context=[item['text'] for item in row['context']],
+            contexts=[item['text'] for item in row['context'] if item['id'] in row['gold_ids']]
+        )
+        test_cases.append(tc)
+    
+    # 3. Évaluation
+    # Ici, tu passes la liste complète des test_cases à ton evaluator
+    # Ton evaluator va traiter chaque objet de la liste et retourner le résultat complet
+    res = evaluator.evaluate(test_cases)
+    
+    # --- Affichage pour le debug ---
+    # Ici, res contient le résultat de TOUS les test_cases
+    print(res) 
+    
+    # 4. Sauvegarde des scores
+    # On récupère le rapport global depuis l'objet retourné
+    final_report = res.report
+    
+    # On crée une ligne avec les scores (sans le suffixe _score comme demandé)
+    scores_data = {
+        "answer_relevancy": final_report.answer_relevancy,
+        "completeness": final_report.completeness,
+        "faithfulness": final_report.faithfulness
+    }
+    
+    # 5. Fusion
+    # On ajoute ces 3 colonnes à tout ton DataFrame
+    df_final = df.copy()
+    for col, value in scores_data.items():
+        df_final[col] = value
+    
+    # 6. Sauvegarde
+    df_final.to_parquet(output_path)
+    print(f"Évaluation terminée. Scores globaux ajoutés et sauvegardés dans : {output_path}")
+    
+    return df_final
