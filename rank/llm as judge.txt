@@ -98,3 +98,23 @@ def run_evaluation_pipeline(file_path, output_path, evaluator):
     print(f"Évaluation terminée. Scores globaux ajoutés et sauvegardés dans : {output_path}")
     
     return df_final
+
+
+
+
+
+
+
+
+
+
+
+# Juste pour tester la première ligne avant de tout lancer
+row = df.iloc[0]
+test = LLMTestCase(
+    input=row['question'],
+    actual_output=row['generated_answer'],
+    retrieval_context=[item['text'] for item in row['context']],
+    contexts=[item['text'] for item in row['context'] if item['id'] in row['gold_ids']]
+)
+print(test.contexts) # Si ça affiche une liste vide, c'est là qu'est le bug
