@@ -182,3 +182,56 @@ def run_evaluation_pipeline(file_path, output_path, evaluator):
     print(f"Évaluation terminée. Scores globaux ajoutés et sauvegardés dans : {output_path}")
     
     return df_final
+
+
+
+
+
+
+
+
+
+
+
+
+
+import pandas as pd
+from deepeval.test_case import LLMTestCase
+
+def run_evaluation_pipeline(file_path, output_path, evaluator):
+    # 1. Chargement
+    df = pd.read_parquet(file_path)
+    print(f"Dataset chargé avec {len(df)} lignes.")
+    
+    # 2. Préparation des test_cases
+    test_cases = []
+    for _, row in df.iterrows():
+        tc = LLMTestCase(
+            input=row['question'],
+            actual_output=row['generated_answer'],
+            retrieval_context=[item['text'] for item in row['contexts']],
+            context=[item['text'] for item in row['contexts'] if item['id'] in row['gold_ids']]
+        )
+        test_cases.append(tc)
+    
+    # 3. Évaluation — un appel par sample
+    results = [evaluator.evaluate(tc) for tc in test_cases]
+    
+    # 4. Affichage détaillé par sample
+    for i, res in enumerate(results):
+        print(f"\n{'─'*60}")
+        print(f"  SAMPLE {i}")
+        print(f"{'─'*60}")
+        print(res)
+    
+    # 5. Fusion scores individuels dans le df
+    df_final = df.copy()
+    df_final["answer_relevancy"] = [res.report.answer_relevancy for res in results]
+    df_final["completeness"]     = [res.report.completeness     for res in results]
+    df_final["faithfulness"]     = [res.report.faithfulness     for res in results]
+    
+    # 6. Sauvegarde
+    df_final.to_parquet(output_path)
+    print(f"\nÉvaluation terminée. Sauvegardé dans : {output_path}")
+    
+    return df_final
