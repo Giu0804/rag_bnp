@@ -1,0 +1,35 @@
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4",
+    quantization="awq",
+    dtype="auto",
+    max_model_len=4096,
+)
+
+def generate(system_prompt: str, user_prompt: str, **kwargs) -> str:
+    sampling_params = SamplingParams(
+        temperature=kwargs.get("temperature", 0.7),
+        max_tokens=kwargs.get("max_tokens", 512),
+    )
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    
+    tokenizer = llm.get_tokenizer()
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    outputs = llm.generate([prompt], sampling_params)
+    return outputs[0].outputs[0].text
+
+
+# Utilisation
+response = generate(
+    system_prompt="Tu es un expert en machine learning.",
+    user_prompt="Explique le fine-tuning en 3 phrases.",
+    temperature=0.5,
+    max_tokens=256,
+)
+print(response)
