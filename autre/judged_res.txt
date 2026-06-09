@@ -1,0 +1,65 @@
+import pandas as pd
+import numpy as np
+
+def analyser_dataset_llm(df, nom_dataset="Mon Dataset"):
+    """
+    Analyse un dataframe contenant les métriques answer_relevancy, completeness et faithfulness.
+    
+    Args:
+        df (pd.DataFrame): Le dataframe à analyser.
+        nom_dataset (str): Le nom du dataset pour l'affichage.
+        
+    Returns:
+        pd.DataFrame: Un nouveau dataframe contenant uniquement les lignes parfaites.
+    """
+    colonnes_etudiees = ['answer_relevancy', 'completeness', 'faithfulness']
+    
+    # Vérification que les colonnes existent
+    for col in colonnes_etudiees:
+        if col not in df.columns:
+            raise ValueError(f"La colonne '{col}' est manquante dans le dataset.")
+
+    print(f"=== Analyse du dataset : {nom_dataset} ===")
+    print(f"Nombre total de lignes : {len(df)}")
+    print("-" * 40)
+    
+    # 1. Compter le nombre de NaN pour chaque colonne
+    print("Nombre de valeurs NaN par métrique :")
+    for col in colonnes_etudiees:
+        nb_nan = df[col].isna().sum()
+        print(f"  - {col} : {nb_nan} NaN")
+        
+    # 2. Donner le nb total de lignes qui n'ont AUCUN NaN sur ces 3 colonnes
+    df_sans_nan = df.dropna(subset=colonnes_etudiees)
+    print(f"\nNombre de lignes avec les 3 métriques valides (sans NaN) : {len(df_sans_nan)}")
+    print("-" * 40)
+    
+    # 3. Afficher les statistiques de chacun des 3 (min, max, mean, median)
+    # Pandas ignore automatiquement les NaN pour ces calculs
+    print("Statistiques descriptives (sans tenir compte des NaN) :")
+    for col in colonnes_etudiees:
+        col_min = df[col].min()
+        col_max = df[col].max()
+        col_mean = df[col].mean()
+        col_median = df[col].median()
+        print(f"  [{col}] -> Min: {col_min:.2f} | Max: {col_max:.2f} | Moyenne: {col_mean:.2f} | Médiane: {col_median:.2f}")
+        
+    print("-" * 40)
+    
+    # 4. Compter le nombre de lignes jugées "parfaites"
+    # Attention aux float, il vaut mieux s'assurer que la condition est exacte
+    condition_parfaite = (
+        (df['completeness'] == 5.0) & 
+        (df['faithfulness'] == 1.0) & 
+        (df['answer_relevancy'] == 1.0)
+    )
+    
+    # 5. Créer un nouveau dataframe avec uniquement ces lignes parfaites (df.copy())
+    df_parfait = df[condition_parfaite].copy()
+    nb_parfaites = len(df_parfait)
+    
+    print(f"Nombre de réponses jugées PARFAITES : {nb_parfaites} (soit {nb_parfaites/len(df)*100:.1f}% du total)")
+    print("==========================================\n")
+    
+    # Retourner la copie contenant uniquement les lignes parfaites
+    return df_parfait
