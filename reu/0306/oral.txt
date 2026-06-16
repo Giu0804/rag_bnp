@@ -1,0 +1,34 @@
+Je pense que le problème est que cette version est trop générique et perd les conclusions intéressantes de ton analyse. Pour une soutenance, il faut garder **3 idées fortes** :
+
+# Grid Search Analysis (BART-MNLI)
+
+### Expected Precision–Recall Trade-off
+
+* Increasing the entailment threshold reduces false positives but also rejects valid evidence.
+* Precision increases while recall decreases.
+
+### Polarized Model Behavior
+
+* Accuracy and F1-score remain nearly constant across thresholds.
+* Most irrelevant chunks receive scores close to 0, while relevant chunks are clearly separated.
+
+### Why 0.3–0.4 Is Optimal
+
+* The model compares a short atomic fact with a long document chunk.
+* Relevant evidence is diluted by surrounding sentences, limiting confidence scores.
+* A threshold of **0.3–0.4** captures valid evidence while filtering out most noise.
+
+### Key Insight
+
+**The optimal threshold is determined by document-level evidence dilution rather than by model limitations.**
+
+Ou encore plus académique :
+
+# Key Findings from the Grid Search
+
+* **Precision–Recall trade-off behaves as expected** when increasing the entailment threshold.
+* **Accuracy and F1-score remain stable**, revealing a highly polarized score distribution.
+* **Optimal threshold found at 0.3–0.4**, where relevant evidence emerges from document noise.
+* **Higher thresholds (e.g., 0.8)** would discard a large proportion of valid supporting sources.
+
+Cette deuxième version ressemble davantage à ce qu'on voit dans un mémoire ou une présentation de recherche. Elle met l'accent sur les **résultats observés** plutôt que sur des généralités de machine learning.
