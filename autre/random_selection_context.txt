@@ -249,3 +249,99 @@ def process_rag_row(row: Dict[str, Any]) -> Union[Dict[str, Any], None]:
         "gold_ids": row.get("gold_ids", []),
         "_nb_chunk": len(new_contexts)
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import random
+import math
+import pandas as pd
+
+def filtrer_dataset_rag_par_score(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prend le dataset RAG (DataFrame) en entrée, applique la logique de ratio
+    et de sélection par le score, et retourne le nouveau DataFrame.
+    """
+    new_rows = []
+    
+    # On boucle sur chaque ligne du dataset (DataFrame)
+    for index, row in df.iterrows():
+        sample_id = row.get("id")
+        question = row.get("question")
+        contexts = row.get("contexts", [])
+        gold_ids = row.get("gold_ids", [])
+        
+        gold_ids_set = set(gold_ids)
+        
+        # 1. Séparer les golds et les non-golds
+        gold_chunks = []
+        non_gold_chunks = []
+        
+        for chunk in contexts:
+            chunk_id = chunk.get("id")
+            if chunk_id in gold_ids_set or str(chunk_id) in gold_ids_set:
+                gold_chunks.append(chunk)
+            else:
+                non_gold_chunks.append(chunk)
+                
+        n_gold = len(gold_chunks)
+        n_non_gold = len(non_gold_chunks)
+        
+        # 2. Trier les non-golds par score décroissant (les meilleurs en premier)
+        non_gold_chunks_sorted = sorted(non_gold_chunks, key=lambda x: x.get("score", 0.0), reverse=True)
+        
+        # 3. Appliquer les règles de sélection
+        if n_gold == 0:
+            # Si pas de gold, on prend entre 2 et 10 non-golds parmi les meilleurs
+            n_add = min(n_non_gold, random.randint(2, 10))
+            new_contexts = non_gold_chunks_sorted[:n_add]
+        else:
+            # Calcul des bornes pour respecter les 20% à 70% de golds
+            min_n_add = math.ceil((3 / 7) * n_gold)
+            max_n_add = min(n_non_gold, 4 * n_gold)
+            
+            # EDGE CASE : Si c'est mathématiquement impossible d'avoir moins de 70% de golds
+            if min_n_add > max_n_add:
+                continue # On discard le sample (on passe à la ligne suivante sans l'ajouter)
+                
+            n_add = random.randint(min_n_add, max_n_add)
+            # On garde tous les golds + les Top-K non-golds
+            new_contexts = gold_chunks + non_gold_chunks_sorted[:n_add]
+            
+        # 4. Mélanger les paires/triplets pour casser le biais de position
+        random.shuffle(new_contexts)
+        
+        # 5. On prépare la nouvelle ligne
+        new_rows.append({
+            "id": sample_id,
+            "question": question,
+            "contexts": new_contexts,
+            "gold_ids": gold_ids, # Reste inchangé
+            "_nb_chunk": len(new_contexts) # Nouvelle colonne demandée
+        })
+        
+    # On reconstruit le nouveau DataFrame à partir des lignes conservées
+    return pd.DataFrame(new_rows)
