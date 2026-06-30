@@ -3,3 +3,17 @@ import numpy as np
 df["contexts"] = df["contexts"].apply(
     lambda x: x.tolist() if isinstance(x, np.ndarray) else x
 )
+
+
+d = df.loc[0, "contexts"][0]
+
+d["id"]
+d["text"]
+d["score"]
+
+
+
+
+df.loc[0, "contexts"][0]["id"]
+df.loc[0, "contexts"][0]["text"]
+df.loc[0, "contexts"][0]["score"]
