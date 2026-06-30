@@ -1,0 +1,5 @@
+import numpy as np
+
+df["contexts"] = df["contexts"].apply(
+    lambda x: x.tolist() if isinstance(x, np.ndarray) else x
+)
