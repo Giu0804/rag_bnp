@@ -1,0 +1,94 @@
+POUR CHAQUE ligne DANS mon_dataframe:
+    
+    // 1. Initialisation de la structure de traçabilité pour la ligne courante
+    Créer une liste vide appelée 'liste_claims_nettoyes'
+    
+    // 2. Récupération des données de la ligne
+    liste_faits = ligne["atomic_claims"]  // Ta liste de chaînes de caractères
+    liste_chunks = ligne["contexts"]      // Ta liste de dicts {"id": ..., "text": ...}
+    
+    // 3. Boucle principale sur chaque fait atomique
+    POUR CHAQUE fait_atomique DANS liste_faits:
+        
+        Créer une liste vide appelée 'chunks_retraités_pour_ce_fait'
+        
+        // 4. Sous-boucle sur les chunks récupérés
+        POUR CHAQUE chunk DANS liste_chunks:
+            
+            identifiant_chunk = chunk["id"]
+            texte_brut_chunk = chunk["text"]
+            
+            // Étape A : Micro-segmentation linguistique (Inspiré de Explain-RAG)
+            liste_phrases = decouper_en_phrases_proprement(texte_brut_chunk)
+            
+            SI liste_phrases est vide:
+                CONTINUER au chunk suivant
+                
+            // Étape B : Vectorisation et Scoring (Via ton modèle Qwen Embedding)
+            vecteur_fait = encoder_qwen(fait_atomique, type="query")
+            liste_vecteurs_phrases = encoder_qwen(liste_phrases, type="document")
+            
+            liste_scores = []
+            POUR CHAQUE vecteur_phrase DANS liste_vecteurs_phrases:
+                score = calculer_similarite_cosinus(vecteur_fait, vecteur_phrase)
+                Ajouter score à liste_scores
+                
+            // Étape C : Calcul du Seuil Topologique Relatif (Notre Expérience 1)
+            moyenne_scores = calculer_moyenne(liste_scores)
+            ecart_type_scores = calculer_ecart_type(liste_scores)
+            seuil_tau = moyenne_scores + (alpha * ecart_type_scores)
+            
+            // Étape D : Sélection et Reconstruction du Subset (Inspiré de VeriCite)
+            phrases_selectionnees = []
+            
+            POUR index, score DANS liste_scores:
+                SI score >= seuil_tau:
+                    Ajouter (index, liste_phrases[index]) à phrases_selectionnees
+                    
+            // Filet de sécurité (Fallback) : si rien ne dépasse le seuil
+            SI phrases_selectionnees est vide:
+                index_max = trouver_index_du_score_maximal(liste_scores)
+                Ajouter (index_max, liste_phrases[index_max]) à phrases_selectionnees
+                
+            // Tri par index d'origine pour préserver l'ordre et la cohérence contractuelle
+            Trier phrases_selectionnees selon le premier élément (l'index)
+            
+            // Reconstruction de la chaîne de texte épurée
+            texte_clean_chunk = joindre_les_phrases_avec_un_espace(phrases_selectionnees)
+            
+            // Étape E : Sauvegarde du dictionnaire avec l'identifiant pour la traçabilité
+            Créer le dictionnaire : {"id": identifiant_chunk, "text": texte_clean_chunk}
+            Ajouter ce dictionnaire à 'chunks_retraités_pour_ce_fait'
+            
+        // Fin de la boucle sur les chunks pour CE fait
+        Créer l'objet de synthèse pour ce fait :
+        objet_fait = {
+            "atomic_claim": fait_atomique,
+            "cleaned_evidence": chunks_retraités_pour_ce_fait
+        }
+        Ajouter objet_fait à 'liste_claims_nettoyes'
+        
+    // Fin de la boucle sur tous les faits de la ligne
+    Enregistrer 'liste_claims_nettoyes' DANS ligne["context_clean"]
+
+
+
+
+
+
+
+[
+  {
+    "atomic_claim": "Fait atomique 1",
+    "cleaned_evidence": [
+      {"id": "chunk_doc_4", "text": "Phrase de preuve A. Phrase de preuve B."},
+      {"id": "chunk_doc_7", "text": "Phrase de preuve C."}
+    ]
+  }
+]
+
+
+
+
+
+

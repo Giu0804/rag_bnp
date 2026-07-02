@@ -1,0 +1,187 @@
+import numpy as np
+import pandas as pd
+import re
+import json
+from sentence_transformers import SentenceTransformer
+
+# =========================================================================
+# 1. INITIALISATION DU VRAI MODÈLE D'EMBEDDING LOCAL
+# =========================================================================
+# Remplace par le nom ou le chemin local de ton modèle d'embedding d'entreprise 
+# (ex: un modèle Qwen Embedding, BGE-M3, ou Multilingual-E5)
+MODEL_NAME = "Qwen/Qwen2.5-LLM-Embed-7B" 
+
+print(f"Chargement du modèle d'embedding local : {MODEL_NAME}...")
+# SentenceTransformer gère nativement le Mean Pooling et le transfert automatique sur GPU (CUDA)
+model_embed = SentenceTransformer(MODEL_NAME, trust_remote_code=True)
+print("Modèle d'embedding prêt et chargé en mémoire.")
+
+
+# =========================================================================
+# 2. INFRASTRUCTURE LINGUISTIQUE ET MATHÉMATIQUE
+# =========================================================================
+
+def decouper_en_phrases_assurance(text: str) -> list:
+    """
+    Découpe un texte long (chunk) en phrases de manière robuste.
+    Inspiré de CiteFix (2025) pour éviter les corruptions sémantiques.
+    Utilise une expression régulière pour ne pas couper sur les points décimaux (ex: 1.5 %).
+    """
+    if not text or not isinstance(text, str):
+        return []
+    
+    # Découpage sur un point suivi d'un espace, à condition qu'il ne soit pas entouré de chiffres
+    sentences = re.split(r'(?<!\d)\.(?!\d)\s+|\n+', text)
+    
+    # Nettoyage des chaînes vides et suppression des espaces superflus
+    return [s.strip() for s in sentences if s.strip()]
+
+
+def calculer_embeddings_normalises(textes: list) -> np.ndarray:
+    """
+    Génère les vecteurs sémantiques en local via les poids du modèle.
+    L'activation de normalize_embeddings=True force une normalisation L2.
+    Grâce à cela, le produit scalaire (dot product) équivaut mathématiquement 
+    à la similarité cosinus.
+    """
+    return model_embed.encode(textes, convert_to_numpy=True, normalize_embeddings=True)
+
+
+# =========================================================================
+# 3. LE CŒUR DU PIPELINE : FILTRAGE TOPOLOGIQUE RELATIF (NIVEAU LIGNE)
+# =========================================================================
+
+def filtrer_ligne_topologique(row: pd.Series, alpha: float) -> list:
+    """
+    Exécute la sélection de subsets de preuve pour une ligne unique du DataFrame.
+    S'inspire des principes de VeriCite (2025) et Explain-RAG (2025) en isolant 
+    les phrases utiles avant l'évaluation par le modèle NLI.
+    """
+    atomic_claims = row["atomic_claims"]  # Liste de chaînes (faits atomiques)
+    contexts = row["contexts"]            # Liste de dictionnaires {"id": ..., "text": ...}
+    
+    structure_ligne_nettoyee = []
+    
+    # Étape 1 : Aligner chaque fait atomique indépendamment pour contrer la dilution
+    for claim in atomic_claims:
+        evidence_par_chunk = []
+        
+        # Encodage du fait atomique (Query) -> Forme mathématique : (1, Dimension)
+        vecteur_claim = calculer_embeddings_normalises([claim])  
+        
+        # Étape 2 : Parcourir les chunks récupérés (Retrieved Chunks)
+        for chunk in contexts:
+            chunk_id = chunk["id"]
+            chunk_text = chunk["text"]
+            
+            # Étape A : Micro-segmentation linguistique
+            phrases = decouper_en_phrases_assurance(chunk_text)
+            if not phrases:
+                continue
+                
+            # Étape B : Extraction géométrique locale au chunk
+            # Forme mathématique : (Nombre_phrases, Dimension)
+            vecteurs_phrases = calculer_embeddings_normalises(phrases)  
+            
+            # Produit matriciel pur pour obtenir la similarité cosinus (grâce à la normalisation L2)
+            # Forme : (Nombre_phrases,)
+            scores = np.dot(vecteurs_phrases, vecteur_claim.T).flatten()
+            
+            # Étape C : Calcul du seuil dynamique (Inspiration théorique CiteGuard 2025)
+            # Traite le chunk comme un système fermé pour s'adapter à sa densité propre
+            mean_score = np.mean(scores)
+            std_score = np.std(scores)
+            tau = mean_score + (alpha * std_score)
+            
+            # Étape D : Sélection adaptative du subset de phrases
+            # L'ordre d'origine (0, 1, 2...) est préservé par construction (Inspiration JHU 2026)
+            indices_retenus = [i for i, score in enumerate(scores) if score >= tau]
+            
+            # Filet de sécurité (Fallback) : si aucune phrase ne dépasse le seuil dynamique,
+            # on extrait mathématiquement la phrase ayant le score maximal absolu.
+            if not indices_retenus:
+                indices_retenus = [int(np.argmax(scores))]
+                
+            # Étape E : Reconstruction du texte épuré et traçabilité de l'ID du chunk
+            texte_nettoye = " ".join([phrases[idx] for idx in indices_retenus])
+            
+            evidence_par_chunk.append({
+                "id": chunk_id,
+                "text": texte_nettoye
+            })
+            
+        # Regroupement par fait atomique
+        structure_ligne_nettoyee.append({
+            "atomic_claim": claim,
+            "cleaned_evidence": evidence_par_chunk
+        })
+        
+    return structure_ligne_nettoyee
+
+
+# =========================================================================
+# 4. ENGINE DE EXPÉRIMENTATION : LE GRID SEARCH AUTOMATIQUE
+# =========================================================================
+
+def executer_grid_search(df_source: pd.DataFrame, alpha_candidates: list) -> pd.DataFrame:
+    """
+    Parcourt la liste des hyperparamètres alpha pour cartographier les performances.
+    Génère une nouvelle colonne de résultats 'context_clean_alpha_X' pour chaque valeur.
+    """
+    df_result = df_source.copy()
+    
+    for alpha in alpha_candidates:
+        # Formatage propre du nom de la colonne pour Pandas (ex: alpha 0.5 -> alpha_0_5)
+        suffixe = str(alpha).replace('.', '_')
+        nom_colonne = f"context_clean_alpha_{suffixe}"
+        
+        print(f"-> Traitement en cours pour l'expérience alpha = {alpha}...")
+        
+        # Application de la logique purement mathématique ligne par ligne
+        df_result[nom_colonne] = df_result.apply(
+            lambda row: filtrer_ligne_topologique(row, alpha=alpha), 
+            axis=1
+        )
+        
+    print("Grid Search terminé avec succès.")
+    return df_result
+
+
+# =========================================================================
+# 5. SIMULATION EXPÉRIMENTALE (BNP CARDIF USE CASE)
+# =========================================================================
+
+if __name__ == "__main__":
+    # Simulation d'une ligne de DataFrame contenant des clauses contractuelles complexes
+    mock_data = {
+        "atomic_claims": [
+            [
+                "La franchise en cas d'inondation est de 10%.", 
+                "L'adhésion requiert une ancienneté de contrat de 3 mois."
+            ]
+        ],
+        "contexts": [
+            [
+                {
+                    "id": "chunk_doc_04", 
+                    "text": "Dispositions Générales Incendie et Eau. En cas de sinistre lié à une inondation, la franchise contractuelle applicable à l'assuré est fixée de manière irrévocable à 10% du montant total des dommages estimés. Les frais de gestion de dossier standard s'élèvent à 50 € par événement."
+                },
+                {
+                    "id": "chunk_doc_07", 
+                    "text": "Conditions d'Éligibilité et Carence. L'assuré ne peut prétendre au bénéfice des garanties du présent contrat qu'au terme d'un délai de carence strict. Le contrat d'assurance doit avoir été activement souscrit depuis plus de 3 mois (90 jours calendaires) au moment de la survenance du sinistre. Aucune dérogation d'ancienneté n'est acceptée par la compagnie."
+                }
+            ]
+        ]
+    }
+    
+    df_test = pd.DataFrame(mock_data)
+    
+    # Définition de notre grille de recherche (de conservateur à ultra-sélectif)
+    grille_alpha = [0.0, 0.5, 1.0]
+    
+    # Lancement de l'expérience
+    df_analyse = executer_grid_search(df_test, grille_alpha)
+    
+    # Affichage du JSON produit pour la colonne optimisée (alpha=0.5) pour valider la structure
+    print("\n================ RÉSULTAT DU SUBSET POUR ALPHA = 0.5 ================")
+    print(json.dumps(df_analyse["context_clean_alpha_0_5"].iloc[0], indent=2, ensure_ascii=False))
