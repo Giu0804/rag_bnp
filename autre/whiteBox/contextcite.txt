@@ -1,0 +1,165 @@
+import torch
+import pandas as pd
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# ==========================================
+# 1. CHARGEMENT DU MODÈLE (À adapter selon ton setup)
+# ==========================================
+model_id = "meta-llama/Llama-3.1-8B-Instruct"
+
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    low_cpu_mem_usage=True
+)
+
+# ==========================================
+# 2. TES FONCTIONS EXISTANTES (Exemple de structure)
+# ==========================================
+def format_prompt_fn(question, chunks_list):
+    """
+    Fonction qui assemble tes chunks et ta question pour créer le prompt utilisateur.
+    S'adapte automatiquement à n'importe quelle liste de chunks passée en entrée.
+    """
+    # Exemple de formatage : on concatène les textes des chunks
+    contexte_assemble = "\n\n".join([c['text'] for c in chunks_list])
+    
+    system_prompt = "Tu es un assistant expert qui répond aux questions en te basant uniquement sur le contexte fourni."
+    user_prompt = f"Voici les documents :\n{contexte_assemble}\n\nQuestion : {question}"
+    
+    return system_prompt, user_prompt
+
+def generate_llama(model, tokenizer, system_prompt, user_prompt):
+    """
+    Ta fonction actuelle qui génère la réponse brute du modèle (.generate())
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=256, do_sample=False) # Greedy pour la stabilité
+    
+    # On décode uniquement la partie générée par l'assistant
+    generated_text = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+    return generated_text.strip()
+
+# ==========================================
+# 3. LE MOTEUR DE CONTEXTCITE SIMPLIFIÉ (Teacher Forcing)
+# ==========================================
+def get_response_log_prob(model, tokenizer, system_prompt, user_prompt, generated_answer):
+    """
+    Calcule la log-probabilité exacte de la réponse 'generated_answer' 
+    sous l'influence du contexte fourni dans 'user_prompt'.
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+        {"role": "assistant", "content": generated_answer}
+    ]
+    
+    # application du template de chat complet (contexte + question + réponse attendue)
+    full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    inputs = tokenizer(full_prompt, return_tensors="pt").to(model.device)
+    
+    # On calcule la longueur de la réponse cible en tokens
+    target_tokens = tokenizer(generated_answer, return_tensors="pt", add_special_tokens=False)
+    target_len = target_tokens.input_ids.shape[1]
+    
+    with torch.no_grad():
+        outputs = model(**inputs)
+        logits = outputs.logits[0] 
+        
+    # Transformation des logits en log-probabilités
+    log_probs = torch.log_softmax(logits, dim=-1)
+    input_ids = inputs.input_ids[0]
+    
+    total_log_prob = 0.0
+    
+    # Alignement : le token i prédit le token i+1
+    start_idx = len(input_ids) - target_len - 1
+    end_idx = len(input_ids) - 1
+    
+    for i in range(start_idx, end_idx):
+        next_token_id = input_ids[i + 1]
+        total_log_prob += log_probs[i, next_token_id].item()
+        
+    return total_log_prob
+
+# ==========================================
+# 4. PIPELINE D'ABLATION PAR CHUNK (LOO)
+# ==========================================
+def run_ablation_pipeline(df, model, tokenizer, format_prompt_fn):
+    results = []
+    
+    for idx, row in df.iterrows():
+        question = row['question']
+        chunks_list = row['contexts']  # Format: [{"id": 0, "text": "..."}, {"id": 34, "text": "..."}]
+        
+        # --- ÉTAPE A : LA BASELINE (Tous les chunks présents) ---
+        system_prompt, user_prompt_full = format_prompt_fn(question, chunks_list)
+        generated_answer = generate_llama(model, tokenizer, system_prompt, user_prompt_full)
+        
+        baseline_log_prob = get_response_log_prob(
+            model, tokenizer, system_prompt, user_prompt_full, generated_answer
+        )
+        
+        # --- ÉTAPE B : L'ABLATION (On retire un ID après l'autre) ---
+        ablation_scores = {}
+        
+        for chunk in chunks_list:
+            current_id = chunk['id']
+            
+            # On exclut le chunk actuel de la liste via son ID unique
+            ablation_chunks = [c for c in chunks_list if c['id'] != current_id]
+            
+            # On recrée le prompt SANS ce chunk
+            _, user_prompt_abated = format_prompt_fn(question, ablation_chunks)
+            
+            # On mesure la probabilité de la réponse initiale sans ce chunk
+            abated_log_prob = get_response_log_prob(
+                model, tokenizer, system_prompt, user_prompt_abated, generated_answer
+            )
+            
+            # Calcul du Delta (Causalité)
+            delta_score = baseline_log_prob - abated_log_prob
+            ablation_scores[current_id] = round(delta_score, 4)
+            
+        # Enregistrement des résultats pour cette ligne
+        results.append({
+            "question": question,
+            "contexts": chunks_list,
+            "generated_answer": generated_answer,
+            "baseline_log_prob": baseline_log_prob,
+            "ablation_scores": ablation_scores  # Renvoie ex: {0: 14.2, 34: 0.01}
+        })
+        
+    return pd.DataFrame(results)
+
+# ==========================================
+# 5. FONCTION D'AFFICHAGE VISUEL POUR TES DÉDUCTIONS
+# ==========================================
+def display_ablation_results(df_res):
+    for idx, row in df_res.iterrows():
+        print(f"=== ANALYSE CAS N°{idx+1} ===")
+        print(f"Question : {row['question']}\n")
+        print(f"Réponse Générée : {row['generated_answer']}\n")
+        print("Résultats de l'ablation par Chunk :")
+        
+        for chunk_id, score in row['ablation_scores'].items():
+            status = "⚪ (Inutile/Bruit)"
+            if score > 5.0:
+                status = "🟢 (CRUCIAL)"
+            elif score > 1.0:
+                status = "🟡 (Important/Secondaire)"
+                
+            print(f"  -> Suppression chunk ID {chunk_id} --> Score d'impact : {score} {status}")
+        print("="*40 + "\n")
