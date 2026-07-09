@@ -1,0 +1,96 @@
+def run_seek_v2_for_nli(df, w=1, k=1, p_main=97.8, p_backoff=90.0):
+    results = []
+    
+    for idx, row in df.iterrows():
+        claims = parse_atomic_claims(row['atomic_claims'])
+        chunks_list = row['contexts']
+        
+        if len(claims) == 0 or len(chunks_list) == 0:
+            results.append({**row.to_dict(), "chunks_filtered": []})
+            continue
+            
+        # 1. Extraction et mapping des unités de chunks
+        all_sentences = []
+        sentence_chunk_ids = []
+        chunk_sentences_dict = {c['id']: [] for c in chunks_list} # Pour grouper par ID à la fin
+        
+        for chunk in chunks_list:
+            sentences = split_insurance_text(chunk['text'])
+            all_sentences.extend(sentences)
+            sentence_chunk_ids.extend([chunk['id']] * len(sentences))
+            
+        if len(all_sentences) == 0:
+            results.append({**row.to_dict(), "chunks_filtered": []})
+            continue
+            
+        # 2. Embeddings et similarité brute (Calcul SEEK standard)
+        e_claims = embed_model.encode(claims, convert_to_tensor=True)
+        e_sentences = embed_model.encode(all_sentences, convert_to_tensor=True)
+        
+        # Fenêtre w=1
+        window_embeddings = []
+        N = len(all_sentences)
+        for i in range(N):
+            start = max(0, i - w)
+            end = min(N, i + w + 1)
+            window_embeddings.append(torch.mean(e_sentences[start:end], dim=0))
+        window_embeddings = torch.stack(window_embeddings)
+        
+        # Matrice de similarité (M x N) en Float32
+        window_embeddings_norm = torch.nn.functional.normalize(window_embeddings, p=2, dim=1)
+        e_claims_norm = torch.nn.functional.normalize(e_claims, p=2, dim=1)
+        similarity_matrix = torch.mm(e_claims_norm.float(), window_embeddings_norm.T.float()).cpu().numpy()
+        
+        # Pas de lissage temporel (k=1) -> smoothed_matrix = similarity_matrix
+        
+        # 3. Double filtrage asymétrique (Main vs Backoff)
+        # Structures pour stocker les indices de phrases validées par chunk ID
+        sentences_to_keep_per_chunk = {c['id']: set() for c in chunks_list}
+        
+        for claim_idx in range(len(claims)):
+            scores_for_claim = similarity_matrix[claim_idx]
+            
+            tau_main = np.percentile(scores_for_claim, p_main)
+            tau_backoff = np.percentile(scores_for_claim, p_backoff)
+            
+            # Étape A: On applique d'abord le filtre de secours global
+            for i in range(N):
+                c_id = sentence_chunk_ids[i]
+                score = scores_for_claim[i]
+                
+                # Si le score passe le couperet principal
+                if score >= tau_main:
+                    sentences_to_keep_per_chunk[c_id].add(i)
+                # Si le score rate le principal mais passe le secours
+                elif score >= tau_backoff:
+                    # Sécurité optionnelle : on peut l'ajouter pour laisser le NLI décider
+                    sentences_to_keep_per_chunk[c_id].add(i)
+
+        # 4. Recomposition du texte filtré en préservant l'ID d'origine
+        chunks_filtered = []
+        for chunk in chunks_list:
+            c_id = chunk['id']
+            # On récupère toutes les phrases de ce chunk spécifique
+            chunk_indices = [i for i, chunk_id in enumerate(sentence_chunk_ids) if chunk_id == c_id]
+            
+            # On ne garde que celles validées par les percentiles
+            valid_indices = sorted(list(sentences_to_keep_per_chunk[c_id].intersection(chunk_indices)))
+            
+            if valid_indices:
+                # Concaténation propre des unités d'évidences
+                filtered_text = " ".join([all_sentences[i] for i in valid_indices])
+                chunks_filtered.append({
+                    "id": c_id,
+                    "text": filtered_text
+                })
+                
+        results.append({
+            "question": row['question'],
+            "contexts": chunks_list,
+            "generated_answer": row['generated_answer'],
+            "atomic_claims": row['atomic_claims'],
+            "GT_cited": row.get('GT_cited', []),
+            "chunks_filtered": chunks_filtered # Le concentré d'évidence pour ton NLI
+        })
+        
+    return pd.DataFrame(results)
