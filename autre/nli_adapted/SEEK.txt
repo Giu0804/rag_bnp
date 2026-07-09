@@ -120,3 +120,57 @@ def run_seek_attribution(df, w=3, k=3, percentile_p=95):
         })
         
     return pd.DataFrame(results)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def compute_metrics(df_res):
+    precisions, recalls, f1_scores, exact_matches = [], [], [] , []
+    
+    def clean_to_set(val):
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            return set()
+        return set(val)
+    
+    for _, row in df_res.iterrows():
+        gt = clean_to_set(row.get('GT_cited', []))
+        pred = clean_to_set(row.get('pred_cited', []))
+        
+        # 1. Calcul de l'Accuracy (Exact Match)
+        em = 1.0 if gt == pred else 0.0
+        exact_matches.append(em)
+        
+        # 2. Calcul des autres métriques
+        if not pred:
+            precision = 1.0 if not gt else 0.0
+            recall = 1.0 if not gt else 0.0
+        else:
+            intersection = gt.intersection(pred)
+            precision = len(intersection) / len(pred)
+            recall = len(intersection) / len(gt) if gt else 1.0
+            
+        f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+        
+        precisions.append(precision)
+        recalls.append(recall)
+        f1_scores.append(f1)
+        
+    print(f"Précision Moyenne : {np.mean(precisions):.2%}")
+    print(f"Rappel Moyen      : {np.mean(recalls):.2%}")
+    print(f"F1-Score Moyen    : {np.mean(f1_scores):.2%}")
+    print(f"Accuracy (EM)     : {np.mean(exact_matches):.2%}")
