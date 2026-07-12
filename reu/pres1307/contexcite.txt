@@ -1,0 +1,122 @@
+Sorry for the confusion, I understand better now: you want an overview of the paper (including the surrogate model, but without mathematics) to set the stage, before diving into the technical details.
+
+Here is a proposal for Slide 1:
+
+**Slide 1: Overview of the "Context Attribution" Method**
+
+* **Title:** Objective: Auditing Source Causality
+* **The General Concept:**
+* An approach to measure the actual responsibility of documents provided to a LLM in generating a response.
+* Moving from a simple content verification (is it true?) to an influence measurement (did the model use this source to generate its response?).
+
+
+* **The Two Pillars of the Method:**
+* **The Target Model:** The LLM that performs the generation based on the documents.
+* **The Surrogate Model:** A lighter model used to calculate impact scores without having to intensively request the main model for each permutation.
+
+
+* **The Logical Flow:**
+* We submit the question and context to the model.
+* We observe the generated response.
+* We apply interventions (document removals) to see how the probability of the response varies.
+* We aggregate the results to rank the documents by "degree of causality".
+
+
+* **Suggested Visual:** Your Figure 1 (showing the complete chain: Context -> LLM -> Response + the supporting role of the surrogate model).
+
+Does this balance work for you for the first slide? If so, shall we move on to Slide 2 for the technical details (maths on ablation)?
+
+
+
+
+
+
+next slide
+
+Here is the rigorous and exclusive synthesis of the ContextCite ablation method (Sections 2.1 and 2.2 of the paper):
+
+**Slide 2: Ablation Mechanics: Fine-Grained Causality**
+
+* **Title:** Impact Quantification: Source Ablation Intervention
+* **Source Definition (Intervention Unit):**
+* The retrieved context $C$ (chunks) is fragmented into a set of $d$ sources $S = \{s_1, s_2, ..., s_d\}$. Each source $s_i$ corresponds to a minimal semantic unit (typically a sentence).
+
+
+* **The Intervention (Physical Ablation):**
+* To isolate the influence of a source $s_i$, an ablation is defined as the physical removal of the tokens composing $s_i$ within the input prompt.
+* The model receives a streamlined context $C_{\setminus i} = C \setminus \{s_i\}$ without modifying the target response $R$.
+
+
+* **Contributive Attribution Equation:**
+* The responsibility score $\tau(s_i)$ measures the log-likelihood differential of the target response $R$ between the full context and the amputated context:
+
+$$\tau(s_i) = \log P_{LM}(R \vert{} C, Q) - \log P_{LM}(R \vert{} ABLATE(C, s_i), Q)$$
+
+
+
+
+* **Calculation via Teacher Forcing (Exact Inference):**
+* The log-likelihood is calculated by summing the token probabilities of response $R$ under context constraints (without new generation):
+
+$$\log P_{LM}(R \vert{} \text{Context}, Q) = \sum_{j=1}^{m} \log P_{LM}(r_j \vert{} r_{<j}, \text{Context}, Q)$$
+
+
+
+
+* **Control Values and Thresholds:**
+* **Sparsity (LASSO):** To handle the large number of sources, the surrogate model uses an $L_1$ regularization with a weight of $\lambda = 0.01$ to force the scores of non-influential sources toward zero.
+* **Number of Ablations:** The sampling for the surrogate model is optimized; 32 random ablations are generally sufficient to estimate contribution coefficients with high fidelity.
+
+
+* **Correct Terminology:**
+* **Contributive Attribution:** Measurement of causal dependence (if $s_i$ is removed, does the model still generate $R$?).
+* **Sparsity-inducing regularization:** Technique used to identify sources that are truly "carriers" of information.
+
+
+
+Does this perfectly align with what you expect for your presentation? Can we move on to Slide 3 (your Chunk-by-Chunk adaptation)?
+
+
+
+
+
+
+
+
+next sidlie
+I understand. For an engineering audience, let's keep it sober, technical, and precise. Here is a streamlined version focusing on the operational gains of your adaptation compared to the academic method.
+
+**Slide 3: Adaptation: LOO Strategy on Chunks**
+
+* **Title:** Scaling Up: Chunk-Level Ablation (LOO)
+* **Why Adapt the Ablation Granularity?**
+* **System Granularity:** The original paper works at the sentence level. For a RAG system, the chunk is the primary retrieval unit.
+* **Semantic Integrity:** Sentence-level ablation can break reference coherence (e.g., coreference resolution). Chunk-level ablation guarantees semantic stability during the intervention.
+
+
+* **Exhaustive "Leave-One-Out" (LOO) Methodology:**
+* **Process:** Instead of sampling ablation vectors to train a surrogate model, we perform a deterministic evaluation by removing each chunk $c_i$ individually for each query.
+* **Advantage:** Elimination of variance related to the surrogate model's approximation.
+
+
+* **Interpretability: Contribution Classification:**
+* We translate the log-likelihood $\Delta$ into a performance diagnosis for the pipeline:
+* **Crucial ($\tau > 5.0$):** The chunk is the causal determinant of the response.
+* **Important ($\tau \in [1.0, 5.0]$):** The chunk provides a secondary but measurable contribution.
+* **Noise ($\tau \approx 0$):** The chunk is ignored by the model; its presence is useless or harmful (distractor).
+
+
+
+
+* **Operational Impact:**
+* **RAG Audit:** Enables immediate factual validation of the relevance of the documents returned by the retriever.
+* **Optimization:** Provides a solid empirical foundation for context pruning (removing non-contributive sources) to improve accuracy.
+
+
+
+Does this more direct, "engineering-focused" vocabulary work better for you?
+
+
+
+
+
