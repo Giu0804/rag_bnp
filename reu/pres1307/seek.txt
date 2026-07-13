@@ -96,3 +96,21 @@ Our Adaptation: Reversed SEEK for Fine-Grained Attribution
 * **Percentile ($p$):** Exploration from $95\%$ to $99\%$ (0.1 step) to calibrate filter selectivity.
 * **Context window ($w$):** Variations from $1$ to $4$ to adjust the semantic horizon around the regex clause.
 * **Smoothing ($k$):** Variations from $1$ to $5$ to test inertia against local noise.
+
+
+
+
+
+REFAIRE DIAPO 2 
+Voici une traduction naturelle et adaptée à une présentation en anglais.
+
+---
+
+## 🖥️ Text Content for Slide 2
+
+### **Overall Framework Pipeline**
+
+* **1. Web Crawling:** Extract raw text from HTML pages and immediately convert each sentence into a **sentence embedding**.
+* **2. Chunking (SEEK Module):** Use the sequence of sentence embeddings to detect local semantic changes and split the document at topic boundaries.
+* **3. Retrieval:** Encode both the query (**claim embedding**) and the segmented passages (**chunk embeddings**) to retrieve the most relevant chunks using cosine similarity with a **FAISS** index.
+* **4. Veracity Prediction:** Combine the query with the top retrieved chunks and use a **LoRA-enhanced LLM** to produce the final veracity prediction.
