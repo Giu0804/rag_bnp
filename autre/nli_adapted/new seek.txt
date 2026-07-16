@@ -246,6 +246,6 @@ def clean_and_split_response(text):
     text = re.sub(r' +', ' ', text)
     
     # ---- ÉTAPE 2 : Découpage (Ton pattern exact) ----
-    pattern = r'(?<=\.)\s+|(?<=;\s+)|\n\s*(?=[-°*])'
+    pattern = r'(?<=\.)\s+|(?<=;)\s+|\n\s*(?=[-°*])'
     
     return [el.strip() for el in re.split(pattern, text) if el.strip()]
