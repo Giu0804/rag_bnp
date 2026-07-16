@@ -1,0 +1,227 @@
+def run_seek_step2_identical_w(df, w=1, k=3, percentile_p=95):
+    """
+    Étape 2 : SEEK avec un voisinage UNIQUE 'w' appliqué à la fois 
+    aux atomic claims ET aux sentences des chunks.
+    """
+    results = []
+    
+    for idx, row in df.iterrows():
+        claims = row['atomics_2']  # Utilise la colonne nettoyée en amont
+        chunks_list = row['contexts']
+        
+        if not claims or not chunks_list:
+            results.append({
+                "question": row['question'],
+                "contexts": chunks_list,
+                "generated_answer": row['generated_answer'],
+                "atomics_2": claims,
+                "GT_cited": row.get('GT_cited', []),
+                "ablation_scores": {},
+                "pred_cited": []
+            })
+            continue
+            
+        # Étape A : Séquence globale de phrases et mapping des IDs
+        all_sentences = []
+        sentence_chunk_ids = []
+        
+        for chunk in chunks_list:
+            c_id = chunk['id']
+            sentences = split_insurance_chunks(chunk['text'])
+            all_sentences.extend(sentences)
+            sentence_chunk_ids.extend([c_id] * len(sentences))
+            
+        if not all_sentences:
+            results.append({
+                "question": row['question'],
+                "contexts": chunks_list,
+                "generated_answer": row['generated_answer'],
+                "atomics_2": claims,
+                "GT_cited": row.get('GT_cited', []),
+                "ablation_scores": {},
+                "pred_cited": []
+            })
+            continue
+            
+        # Étape B : Vectorisation nominale
+        e_claims_raw = embed_model.encode(claims, prompt_name="query", convert_to_tensor=True)
+        e_sentences_raw = embed_model.encode(all_sentences, convert_to_tensor=True)
+        
+        # Étape C1 : Fenêtrage glissant sur les CLAIMS avec 'w'
+        N_claims = len(claims)
+        window_claims = []
+        for i in range(N_claims):
+            start = max(0, i - w)
+            end = min(N_claims, i + w + 1)
+            v_i = torch.mean(e_claims_raw[start:end], dim=0)
+            window_claims.append(v_i)
+        e_claims = torch.stack(window_claims)
+        
+        # Étape C2 : Fenêtrage glissant sur les CHUNKS avec le MÊME 'w'
+        N_chunks = len(all_sentences)
+        window_sentences = []
+        for i in range(N_chunks):
+            start = max(0, i - w)
+            end = min(N_chunks, i + w + 1)
+            v_i = torch.mean(e_sentences_raw[start:end], dim=0)
+            window_sentences.append(v_i)
+        e_sentences = torch.stack(window_sentences)
+        
+        # Étape D : Similarité Cosinus
+        e_sentences_norm = torch.nn.functional.normalize(e_sentences, p=2, dim=1)
+        e_claims_norm = torch.nn.functional.normalize(e_claims, p=2, dim=1)
+        similarity_matrix = torch.mm(e_claims_norm, e_sentences_norm.T).cpu().numpy()
+        
+        # Étape E : Lissage Temporel (Smoothing sur l'axe des chunks via k)
+        smoothed_matrix = np.zeros_like(similarity_matrix)
+        half_k = k // 2
+        for i in range(N_chunks):
+            start = max(0, i - half_k)
+            end = min(N_chunks, i + half_k + 1)
+            smoothed_matrix[:, i] = np.mean(similarity_matrix[:, start:end], axis=1)
+            
+        # Étape F : Application du Seuil Percentile et Max-Pooling par Chunk ID
+        chunk_scores = {chunk['id']: 0.0 for chunk in chunks_list}
+        pred_cited_set = set()
+        
+        for claim_idx in range(len(claims)):
+            scores_for_claim = smoothed_matrix[claim_idx]
+            tau = np.percentile(scores_for_claim, percentile_p)
+            
+            for i in range(N_chunks):
+                if scores_for_claim[i] >= tau:
+                    c_id = sentence_chunk_ids[i]
+                    pred_cited_set.add(c_id)
+                    
+                    if scores_for_claim[i] > chunk_scores[c_id]:
+                        chunk_scores[c_id] = float(np.round(scores_for_claim[i], 4))
+                        
+        results.append({
+            "question": row['question'],
+            "contexts": chunks_list,
+            "generated_answer": row['generated_answer'],
+            "atomics_2": claims,
+            "GT_cited": row.get('GT_cited', []),
+            "ablation_scores": chunk_scores,
+            "pred_cited": list(pred_cited_set)
+        })
+        
+    return pd.DataFrame(results)
+
+
+
+
+
+
+
+
+
+def run_seek_step3_double_w(df, w1=1, w2=2, k=3, percentile_p=95):
+    """
+    Étape 3 : SEEK avec deux fenêtres distinctes :
+    w1 pour les atomic claims, w2 pour les sentences des chunks.
+    """
+    results = []
+    
+    for idx, row in df.iterrows():
+        claims = row['atomics_2']
+        chunks_list = row['contexts']
+        
+        if not claims or not chunks_list:
+            results.append({
+                "question": row['question'],
+                "contexts": chunks_list,
+                "generated_answer": row['generated_answer'],
+                "atomics_2": claims,
+                "GT_cited": row.get('GT_cited', []),
+                "ablation_scores": {},
+                "pred_cited": []
+            })
+            continue
+            
+        # Étape A : Séquence globale de phrases et mapping des IDs
+        all_sentences = []
+        sentence_chunk_ids = []
+        
+        for chunk in chunks_list:
+            c_id = chunk['id']
+            sentences = split_insurance_chunks(chunk['text'])
+            all_sentences.extend(sentences)
+            sentence_chunk_ids.extend([c_id] * len(sentences))
+            
+        if not all_sentences:
+            results.append({
+                "question": row['question'],
+                "contexts": chunks_list,
+                "generated_answer": row['generated_answer'],
+                "atomics_2": claims,
+                "GT_cited": row.get('GT_cited', []),
+                "ablation_scores": {},
+                "pred_cited": []
+            })
+            continue
+            
+        # Étape B : Vectorisation
+        e_claims_raw = embed_model.encode(claims, prompt_name="query", convert_to_tensor=True)
+        e_sentences_raw = embed_model.encode(all_sentences, convert_to_tensor=True)
+        
+        # Étape C1 : Fenêtrage glissant sur les CLAIMS (avec w1)
+        N_claims = len(claims)
+        window_claims = []
+        for i in range(N_claims):
+            start = max(0, i - w1)
+            end = min(N_claims, i + w1 + 1)
+            v_i = torch.mean(e_claims_raw[start:end], dim=0)
+            window_claims.append(v_i)
+        e_claims = torch.stack(window_claims)
+        
+        # Étape C2 : Fenêtrage glissant sur les CHUNKS (avec w2)
+        N_chunks = len(all_sentences)
+        window_sentences = []
+        for i in range(N_chunks):
+            start = max(0, i - w2)
+            end = min(N_chunks, i + w2 + 1)
+            v_i = torch.mean(e_sentences_raw[start:end], dim=0)
+            window_sentences.append(v_i)
+        e_sentences = torch.stack(window_sentences)
+        
+        # Étape D : Similarité Cosinus
+        e_sentences_norm = torch.nn.functional.normalize(e_sentences, p=2, dim=1)
+        e_claims_norm = torch.nn.functional.normalize(e_claims, p=2, dim=1)
+        similarity_matrix = torch.mm(e_claims_norm, e_sentences_norm.T).cpu().numpy()
+        
+        # Étape E : Lissage Temporel (Smoothing sur l'axe des chunks via k)
+        smoothed_matrix = np.zeros_like(similarity_matrix)
+        half_k = k // 2
+        for i in range(N_chunks):
+            start = max(0, i - half_k)
+            end = min(N_chunks, i + half_k + 1)
+            smoothed_matrix[:, i] = np.mean(similarity_matrix[:, start:end], axis=1)
+            
+        # Étape F : Application du Seuil Percentile et Max-Pooling par Chunk ID
+        chunk_scores = {chunk['id']: 0.0 for chunk in chunks_list}
+        pred_cited_set = set()
+        
+        for claim_idx in range(len(claims)):
+            scores_for_claim = smoothed_matrix[claim_idx]
+            tau = np.percentile(scores_for_claim, percentile_p)
+            
+            for i in range(N_chunks):
+                if scores_for_claim[i] >= tau:
+                    c_id = sentence_chunk_ids[i]
+                    pred_cited_set.add(c_id)
+                    
+                    if scores_for_claim[i] > chunk_scores[c_id]:
+                        chunk_scores[c_id] = float(np.round(scores_for_claim[i], 4))
+                        
+        results.append({
+            "question": row['question'],
+            "contexts": chunks_list,
+            "generated_answer": row['generated_answer'],
+            "atomics_2": claims,
+            "GT_cited": row.get('GT_cited', []),
+            "ablation_scores": chunk_scores,
+            "pred_cited": list(pred_cited_set)
+        })
+        
+    return pd.DataFrame(results)
