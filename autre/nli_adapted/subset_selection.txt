@@ -319,3 +319,144 @@ def run_seek_attribution(df, w=3, k=3, percentile_p=95):
         })
         
     return pd.DataFrame(results)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# bien separer les chunks pas de  vérification entre différents chunks
+import pandas as pd
+import numpy as np
+import torch
+
+def run_seek_attribution(df, w=3, k=3, percentile_p=95):
+    results = []
+    
+    for idx, row in df.iterrows():
+        claims = parse_atomic_claims(row['atomic_claims'])
+        chunks_list = row['contexts']
+        
+        if not claims or not chunks_list:
+            results.append({
+                "question": row['question'],
+                "contexts": chunks_list,
+                "generated_answer": row['generated_answer'],
+                "atomic_claims": row.get('atomic_claims', ''),
+                "GT_cited": row.get('GT_cited', []),
+                "ablation_scores": {},
+                "pred_cited": [],
+                "chunks_filtered": []
+            })
+            continue
+            
+        # Étape B.1 : Vectorisation des claims (commune à tout le row)
+        e_claims = embed_model.encode(claims, prompt_name="query", convert_to_tensor=True)
+        e_claims_norm = torch.nn.functional.normalize(e_claims, p=2, dim=1)
+        
+        chunk_scores = {chunk['id']: 0.0 for chunk in chunks_list}
+        pred_cited_set = set()
+        chunks_filtered = []
+        
+        # ====================================================================
+        # TRAITEMENT STRICTEMENT ISOLÉ : CHUNK PAR CHUNK
+        # ====================================================================
+        for chunk in chunks_list:
+            c_id = chunk['id']
+            sentences = split_insurance_text(chunk['text'])
+            N_chunk = len(sentences)
+            
+            # Si le chunk est vide, on passe au suivant
+            if N_chunk == 0:
+                continue
+                
+            # Étape B.2 : Vectorisation des phrases du chunk courant uniquement
+            e_sentences = embed_model.encode(sentences, convert_to_tensor=True)
+            
+            # Étape C : Fenêtres contextuelles glissantes SEEK (bridées au chunk)
+            window_embeddings = []
+            for i in range(N_chunk):
+                start = max(0, i - w)
+                end = min(N_chunk, i + w + 1)
+                v_i = torch.mean(e_sentences[start:end], dim=0)
+                window_embeddings.append(v_i)
+            window_embeddings = torch.stack(window_embeddings)
+            
+            # Étape D : Similarité brute (Cosinus)
+            window_embeddings_norm = torch.nn.functional.normalize(window_embeddings, p=2, dim=1)
+            similarity_matrix = torch.mm(e_claims_norm, window_embeddings_norm.T).cpu().numpy()
+            
+            # Étape E : Lissage Temporel (Smoothing bridé au chunk)
+            smoothed_matrix = np.zeros_like(similarity_matrix)
+            half_k = k // 2
+            for i in range(N_chunk):
+                start = max(0, i - half_k)
+                end = min(N_chunk, i + half_k + 1)
+                smoothed_matrix[:, i] = np.mean(similarity_matrix[:, start:end], axis=1)
+                
+            # Étape F : Application du Seuil (Percentile) à l'échelle du CHUNK
+            # Note : Le percentile est calculé sur les scores de ce chunk pour ce claim précis
+            validated_indices = set()
+            
+            for claim_idx in range(len(claims)):
+                scores_for_claim = smoothed_matrix[claim_idx]
+                tau = np.percentile(scores_for_claim, percentile_p)
+                
+                for i in range(N_chunk):
+                    if scores_for_claim[i] >= tau:
+                        pred_cited_set.add(c_id)
+                        validated_indices.add(i) # Indice local au chunk
+                        
+                        if scores_for_claim[i] > chunk_scores[c_id]:
+                            chunk_scores[c_id] = float(np.round(scores_for_claim[i], 4))
+            
+            # Étape F.bis : Extraction des sous-portions et de leurs voisins (100% interne)
+            extended_indices = set()
+            for idx_val in validated_indices:
+                start_w = max(0, idx_val - w)
+                end_w = min(N_chunk, idx_val + w + 1)
+                
+                for neighbor_idx in range(start_w, end_w):
+                    extended_indices.add(neighbor_idx)
+                    
+            valid_indices = sorted(list(extended_indices))
+            
+            if valid_indices:
+                filtered_text = " ".join([sentences[i] for i in valid_indices])
+                chunks_filtered.append({
+                    "id": c_id,
+                    "text": filtered_text
+                })
+        
+        # Étape G : Stockage complet
+        results.append({
+            "question": row['question'],
+            "contexts": chunks_list,
+            "generated_answer": row['generated_answer'],
+            "atomic_claims": row['atomic_claims'],
+            "GT_cited": row.get('GT_cited', []),       
+            "ablation_scores": chunk_scores,           
+            "pred_cited": list(pred_cited_set),        
+            "chunks_filtered": chunks_filtered         
+        })
+        
+    return pd.DataFrame(results)
