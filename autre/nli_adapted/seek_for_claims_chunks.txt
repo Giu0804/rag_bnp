@@ -1,0 +1,301 @@
+import re
+
+# =====================================================================
+# 1. Prétraitement pour les FAITS ATOMIQUES (avec nettoyage des IDs)
+# =====================================================================
+def clean_atomic_claims_text(text):
+    """Supprime les mentions d'IDs et paragraphes dans la réponse générée."""
+    if not text or pd.isna(text):
+        return ""
+
+    t = str(text)
+    # Suppression des ID/paragraphes
+    id_pattern = r'(?i)(?:les?\s+|des?\s+)?(?:paragraphes?|sections?|docs?|documents?)?\s*\(?\s*IDs?\s*:?\s*\d+(?:\s*(?:,|\-|et|ou)\s*\d+)*\s*\)?'
+    t = re.sub(id_pattern, '', t)
+    # Nettoyage des espaces
+    t = re.sub(r'[ \t]+', ' ', t)
+    t = re.sub(r'\n\s*\n', '\n', t)
+    return t.strip()
+
+
+def pre_split_atomic_claims(text):
+    """
+    Découpe aux points, points-virgules, puces/tirets de liste et sauts de ligne.
+    Protège la numérotation des titres (ne coupe pas si suivi de **).
+    """
+    cleaned = clean_atomic_claims_text(text)
+    if not cleaned:
+        return []
+
+    # Découpe aux points/points-virgules/sauts de ligne (pas avant **) OU sur les tirets/puces
+    pattern = r'(?<=[.;!\n])\s+(?!\*\*)|(?<=\n)\s*[-*•]\s*'
+    units = re.split(pattern, cleaned)
+    
+    return [u.strip() for u in units if u.strip() and len(u.strip()) > 3]
+
+
+# =====================================================================
+# 2. Prétraitement pour les CHUNKS (MÊME découpage, SANS nettoyage ID)
+# =====================================================================
+def clean_chunk_text(text):
+    """Garde le texte original du chunk, nettoie juste les espaces superflus."""
+    if not text or pd.isna(text):
+        return ""
+    
+    t = str(text)
+    t = re.sub(r'[ \t]+', ' ', t)
+    return t.strip()
+
+
+def pre_split_chunks(text):
+    """
+    MÊME logique de découpage que les faits atomiques :
+    Découpe aux points, points-virgules, puces/tirets de liste et sauts de ligne.
+    Protège aussi les titres (pas de coupe avant **).
+    """
+    cleaned = clean_chunk_text(text)
+    if not cleaned:
+        return []
+
+    # Identique à pre_split_atomic_claims : découpe phrases + tirets de listes
+    pattern = r'(?<=[.;!\n])\s+(?!\*\*)|(?<=\n)\s*[-*•]\s*'
+    units = re.split(pattern, cleaned)
+    
+    return [u.strip() for u in units if u.strip() and len(u.strip()) > 3]
+
+
+
+
+
+
+
+
+
+import torch
+import numpy as np
+import pandas as pd
+import re
+
+# =====================================================================
+# ÉTAPE 1 : Prétraitements et Découpages Initiaux
+# =====================================================================
+
+def clean_atomic_claims_text(text):
+    """Supprime les mentions d'IDs, paragraphes et numérotations dans la réponse générée."""
+    if not text or pd.isna(text):
+        return ""
+    t = str(text)
+    # Suppression des ID / paragraphes / sections
+    id_pattern = r'(?i)(?:les?\s+|des?\s+)?(?:paragraphes?|sections?|docs?|documents?)?\s*\(?\s*IDs?\s*:?\s*\d+(?:\s*(?:,|\-|et|ou)\s*\d+)*\s*\)?'
+    t = re.sub(id_pattern, '', t)
+    # Nettoyage des espaces multiples
+    t = re.sub(r'[ \t]+', ' ', t)
+    t = re.sub(r'\n\s*\n', '\n', t)
+    return t.strip()
+
+
+def pre_split_atomic_claims(text):
+    """Segmentation initiale pour la réponse générée (fait atomiques)."""
+    cleaned = clean_atomic_claims_text(text)
+    if not cleaned:
+        return []
+    # Découpe aux points, points-virgules, puces/tirets de liste et sauts de ligne (protège les **)
+    pattern = r'(?<=[.;!\n])\s+(?!\*\*)|(?<=\n)\s*[-*•]\s*'
+    units = re.split(pattern, cleaned)
+    return [u.strip() for u in units if u.strip() and len(u.strip()) > 3]
+
+
+def clean_chunk_text(text):
+    """Conserve le texte original du chunk en nettoyant les espaces superflus."""
+    if not text or pd.isna(text):
+        return ""
+    t = str(text)
+    t = re.sub(r'[ \t]+', ' ', t)
+    return t.strip()
+
+
+def pre_split_chunks(text):
+    """Segmentation initiale pour les chunks (même règles de coupe, sans suppression d'ID)."""
+    cleaned = clean_chunk_text(text)
+    if not cleaned:
+        return []
+    pattern = r'(?<=[.;!\n])\s+(?!\*\*)|(?<=\n)\s*[-*•]\s*'
+    units = re.split(pattern, cleaned)
+    return [u.strip() for u in units if u.strip() and len(u.strip()) > 3]
+
+
+# =====================================================================
+# ÉTAPE 2 : Fonctions de Segmentation SEEK
+# =====================================================================
+
+def segment_with_seek_vectorial(embed_model, text, w=1, k=3, percentile_p=90, is_chunk=False):
+    """
+    Segmentation SEEK - Variante A : Moyenne Vectorielle des Embeddings.
+    """
+    units = pre_split_chunks(text) if is_chunk else pre_split_atomic_claims(text)
+    if len(units) <= 1:
+        return units
+
+    N = len(units)
+    # Encodage individuel de chaque unité
+    embeddings = embed_model.encode(units, convert_to_tensor=True)
+    embeddings_norm = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+
+    # 1. Calcul du score de rupture Delta_i = 1 - cos(L_i, R_i) aux N-1 frontières
+    raw_deltas = []
+    for i in range(N - 1):
+        # Bloc Gauche (Li) : w unités jusqu'à i
+        left_start = max(0, i - w + 1)
+        l_i = torch.mean(embeddings_norm[left_start:i+1], dim=0)
+
+        # Bloc Droite (Ri) : w unités après i
+        right_end = min(N, i + 1 + w)
+        r_i = torch.mean(embeddings_norm[i+1:right_end], dim=0)
+
+        # Similarité cosinus et rupture
+        cos_sim = torch.dot(l_i, r_i).item()
+        raw_deltas.append(1.0 - cos_sim)
+
+    raw_deltas = np.array(raw_deltas)
+
+    # 2. Lissage Temporel (k)
+    smoothed_deltas = np.zeros_like(raw_deltas)
+    half_k = k // 2
+    num_frontiers = len(raw_deltas)
+    for i in range(num_frontiers):
+        start = max(0, i - half_k)
+        end = min(num_frontiers, i + half_k + 1)
+        smoothed_deltas[i] = np.mean(raw_deltas[start:end])
+
+    # 3. Calcul du Seuil tau via Percentile
+    tau = np.percentile(smoothed_deltas, percentile_p)
+
+    # 4. Regroupement aux frontières de rupture (b_i = 1 si smoothed_deltas[i] >= tau)
+    segments = []
+    current_segment = [units[0]]
+
+    for i in range(num_frontiers):
+        if smoothed_deltas[i] >= tau:
+            # Rupture sémantique détectée -> fermeture du segment courant
+            segments.append(" ".join(current_segment))
+            current_segment = [units[i + 1]]
+        else:
+            # Continuité sémantique -> fusion avec l'unité suivante
+            current_segment.append(units[i + 1])
+            
+    if current_segment:
+        segments.append(" ".join(current_segment))
+
+    return segments
+
+
+def segment_with_seek_textual(embed_model, text, w=1, k=3, percentile_p=90, is_chunk=False):
+    """
+    Segmentation SEEK - Variante B : Contexte Intégré au niveau Textuel (Concaténation).
+    """
+    units = pre_split_chunks(text) if is_chunk else pre_split_atomic_claims(text)
+    if len(units) <= 1:
+        return units
+
+    N = len(units)
+
+    # 1. Construction des paires de blocs de texte concaténés
+    left_texts, right_texts = [], []
+    for i in range(N - 1):
+        left_start = max(0, i - w + 1)
+        right_end = min(N, i + 1 + w)
+
+        left_texts.append(" ".join(units[left_start:i+1]))
+        right_texts.append(" ".join(units[i+1:right_end]))
+
+    # Encodage direct par le Transformer (permet à l'attention de traiter le contexte)
+    left_emb = embed_model.encode(left_texts, convert_to_tensor=True)
+    right_emb = embed_model.encode(right_texts, convert_to_tensor=True)
+
+    left_emb_norm = torch.nn.functional.normalize(left_emb, p=2, dim=1)
+    right_emb_norm = torch.nn.functional.normalize(right_emb, p=2, dim=1)
+
+    # Similarité cosinus et rupture Delta_i = 1 - cos(L_i, R_i)
+    cos_sims = (left_emb_norm * right_emb_norm).sum(dim=1).cpu().numpy()
+    raw_deltas = 1.0 - cos_sims
+
+    # 2. Lissage Temporel (k)
+    smoothed_deltas = np.zeros_like(raw_deltas)
+    half_k = k // 2
+    num_frontiers = len(raw_deltas)
+    for i in range(num_frontiers):
+        start = max(0, i - half_k)
+        end = min(num_frontiers, i + half_k + 1)
+        smoothed_deltas[i] = np.mean(raw_deltas[start:end])
+
+    # 3. Seuil tau
+    tau = np.percentile(smoothed_deltas, percentile_p)
+
+    # 4. Regroupement
+    segments = []
+    current_segment = [units[0]]
+
+    for i in range(num_frontiers):
+        if smoothed_deltas[i] >= tau:
+            segments.append(" ".join(current_segment))
+            current_segment = [units[i + 1]]
+        else:
+            current_segment.append(units[i + 1])
+            
+    if current_segment:
+        segments.append(" ".join(current_segment))
+
+    return segments
+
+
+# =====================================================================
+# ÉTAPE 3 : Pipeline Global d'Enrichissement du Dataset
+# =====================================================================
+
+def process_dataset_with_seek_segmentation(df, embed_model, variant="textual", w=1, k=3, percentile_p=90):
+    """
+    Prend le DataFrame d'origine et génère un nouveau DataFrame enrichi des colonnes:
+    - atomic_claims2 : Nouveaux faits atomiques découpés par SEEK
+    - contexts2 : Liste de sous-portions de chunks au format {"id": ..., "text": ...}
+    """
+    segment_fn = segment_with_seek_textual if variant == "textual" else segment_with_seek_vectorial
+    
+    processed_rows = []
+
+    for idx, row in df.iterrows():
+        gen_answer = row['generated_answer']
+        chunks_list = row['contexts']  # Liste de dicts [{"id": ..., "text": ...}, ...]
+
+        # A. Segmentation de la réponse générée en faits atomiques (Nettoyage ID actif)
+        atomic_claims2 = segment_fn(
+            embed_model, gen_answer, w=w, k=k, percentile_p=percentile_p, is_chunk=False
+        )
+
+        # B. Segmentation des chunks en sous-portions (Maintien strict de l'ID d'origine)
+        contexts2 = []
+        for chunk in chunks_list:
+            c_id = chunk['id']
+            c_text = chunk['text']
+
+            sub_portions = segment_fn(
+                embed_model, c_text, w=w, k=k, percentile_p=percentile_p, is_chunk=True
+            )
+
+            # Conservation de l'ID pour Max-Pooling/Metrics
+            for sub_p in sub_portions:
+                contexts2.append({
+                    "id": c_id,
+                    "text": sub_p
+                })
+
+        # Assemblage final de la ligne du DataFrame
+        processed_rows.append({
+            "question": row['question'],
+            "generated_answer": gen_answer,
+            "GT_cited": row['GT_cited'],
+            "contexts": chunks_list,                # Anciens chunks conservés
+            "atomic_claims2": atomic_claims2,        # Nouveaux faits découpés par SEEK
+            "contexts2": contexts2                  # Nouveaux sub-chunks avec ID
+        })
+
+    return pd.DataFrame(processed_rows)
