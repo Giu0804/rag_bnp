@@ -1,0 +1,145 @@
+import numpy as np
+import pandas as pd
+import torch
+from FlagEmbedding import BGEM3FlagModel
+
+# Initialisation de BGE-M3
+embed_model = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
+
+
+def run_seek_attribution_bge_m3(df, w=1, k=3, percentile_p=95):
+    results = []
+
+    for idx, row in df.iterrows():
+        claims = parse_atomic_claims(row["atomic_claims"])
+        chunks_list = row["contexts"]
+
+        if not claims or not chunks_list:
+            results.append({
+                "question": row["question"],
+                "contexts": chunks_list,
+                "generated_answer": row["generated_answer"],
+                "atomic_claims": row.get("atomic_claims", ""),
+                "GT_cited": row.get("GT_cited", []),
+                "ablation_scores": {},
+                "pred_cited": [],
+                "filtered_chunks": [],  # Format [{"id": int, "text": str}]
+            })
+            continue
+
+        # Étape A : Séquence globale de phrases et mapping des IDs
+        all_sentences = []
+        sentence_chunk_ids = []
+
+        for chunk in chunks_list:
+            c_id = chunk["id"]
+            sentences = split_insurance_text(chunk["text"])
+            all_sentences.extend(sentences)
+            sentence_chunk_ids.extend([c_id] * len(sentences))
+
+        N = len(all_sentences)
+        if N == 0:
+            results.append({
+                "question": row["question"],
+                "contexts": chunks_list,
+                "generated_answer": row["generated_answer"],
+                "atomic_claims": row.get("atomic_claims", ""),
+                "GT_cited": row.get("GT_cited", []),
+                "ablation_scores": {},
+                "pred_cited": [],
+                "filtered_chunks": [],
+            })
+            continue
+
+        # Étape B & C : Fenêtres contextuelles intégrées (texte continu i-w à i+w)
+        integrated_windows = []
+        for i in range(N):
+            start = max(0, i - w)
+            end = min(N, i + w + 1)
+            window_text = " ".join(all_sentences[start:end])
+            integrated_windows.append(window_text)
+
+        # Vectorisation ColBERT (Multi-Vector) avec BGE-M3
+        out_claims = embed_model.encode(
+            claims, return_dense=False, return_colbert_vecs=True
+        )
+        out_windows = embed_model.encode(
+            integrated_windows, return_dense=False, return_colbert_vecs=True
+        )
+
+        # Étape D : Matrice de Similarité Brute via ColBERT MaxSim
+        similarity_matrix = np.zeros((len(claims), N))
+        for claim_idx, q_vec in enumerate(out_claims["colbert_vecs"]):
+            for win_idx, d_vec in enumerate(out_windows["colbert_vecs"]):
+                score = embed_model.colbert_score(q_vec, d_vec).item()
+                similarity_matrix[claim_idx, win_idx] = score
+
+        # Étape E : Lissage Temporel (Smoothing k=3)
+        smoothed_matrix = np.zeros_like(similarity_matrix)
+        half_k = k // 2
+        for i in range(N):
+            start = max(0, i - half_k)
+            end = min(N, i + half_k + 1)
+            smoothed_matrix[:, i] = np.mean(
+                similarity_matrix[:, start:end], axis=1
+            )
+
+        # Étape F : Seuil, Max-Pooling et Extraction des Sous-Portions Validées
+        chunk_scores = {chunk["id"]: 0.0 for chunk in chunks_list}
+        pred_cited_set = set()
+
+        # Dictionnaire pour collecter les phrases retenues par chunk ID : {c_id: {index_phrase: texte_phrase}}
+        valid_sentences_per_chunk = {chunk["id"]: {} for chunk in chunks_list}
+
+        for claim_idx in range(len(claims)):
+            scores_for_claim = smoothed_matrix[claim_idx]
+            tau = np.percentile(scores_for_claim, percentile_p)
+
+            for i in range(N):
+                # Si la paire fait-fenêtre dépasse le seuil adaptatif du percentile
+                if scores_for_claim[i] >= tau:
+                    c_id = sentence_chunk_ids[i]
+                    pred_cited_set.add(c_id)
+
+                    # Stockage de la phrase originale responsable du dépassement de seuil
+                    # (On utilise l'index 'i' pour conserver l'ordre d'apparition original)
+                    valid_sentences_per_chunk[c_id][i] = all_sentences[i]
+
+                    # Mise à jour du score max du chunk
+                    if scores_for_claim[i] > chunk_scores[c_id]:
+                        chunk_scores[c_id] = float(
+                            np.round(scores_for_claim[i], 4)
+                        )
+
+        # Construction de la liste 'filtered_chunks' au format exact [{"id": c_id, "text": ...}]
+        filtered_chunks_list = []
+        for chunk in chunks_list:
+            c_id = chunk["id"]
+            if c_id in pred_cited_set:
+                # Récupération des phrases validées triées par leur ordre d'index original 'i'
+                sentence_dict = valid_sentences_per_chunk[c_id]
+                sorted_indices = sorted(sentence_dict.keys())
+
+                # Concaténation des sous-portions dans l'ordre naturel d'apparition
+                concatenated_text = " ".join([
+                    sentence_dict[idx] for idx in sorted_indices
+                ])
+
+                filtered_chunks_list.append({
+                    "id": c_id,
+                    "text": concatenated_text,
+                })
+
+        # Étape G : Stockage complet
+        results.append({
+            "question": row["question"],
+            "contexts": chunks_list,
+            "generated_answer": row["generated_answer"],
+            "atomic_claims": row["atomic_claims"],
+            "GT_cited": row.get("GT_cited", []),
+            "ablation_scores": chunk_scores,
+            "pred_cited": list(pred_cited_set),
+            "filtered_chunks": filtered_chunks_list,  # Liste nettoyée et ordonnée
+        })
+
+    return pd.DataFrame(results)
