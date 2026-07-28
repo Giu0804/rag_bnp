@@ -687,3 +687,8 @@ df_results = run_seek_ot_integrated(
 
 # 3. Générer le graphique compact
 plot_optimal_transport_sample(df_results, row_index=0, aggregate_by_chunk=True)
+
+
+
+
+
