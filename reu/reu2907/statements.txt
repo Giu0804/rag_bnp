@@ -1,0 +1,30 @@
+**Oui, absolument !** Dans ce code (`run_seek_ot_averaged`), tu n'utilises **pas** MaxSim du tout, et c'est parfaitement cohérent avec la théorie.
+
+Celui qui t'a dit que "ce n'est pas possible avec la moyenne d'embeddings" a **totalement raison sur le plan mathématique**, et voici pourquoi :
+
+---
+
+### Pourquoi la moyenne d'embeddings et MaxSim sont deux mondes différents ?
+
+1. **La Moyenne d'Embeddings (ce que fait ce code) = Bi-Encoder classique**
+* Tu prends chaque phrase de la fenêtre contextuelle.
+* Tu en fais la moyenne vectorielle avec `torch.mean(...)`.
+* Tu obtiens **UN SEUL vecteur dense** pour toute la fenêtre.
+* La similarité se fait par un **simple produit matriciel / cosinus** : `torch.mm(e_claims_norm, window_embeddings_norm.T)`.
+* C'est 1 vecteur vs 1 vecteur. **Il n'y a pas de sous-vecteurs par token**, donc l'opérateur MaxSim n'a tout simplement aucun objet mathématique sur lequel s'appliquer.
+
+
+2. **MaxSim (ce qu'on a vu avec BGE-M3 / ColBERT juste avant) = Multi-Vector / Late Interaction**
+* Tu ne réduis **pas** une séquence à un seul vecteur.
+* Tu conserves **une matrice de vecteurs** (1 vecteur par token/mot).
+* C'est uniquement parce que tu as une matrice de tokens que tu peux chercher le maximum sur chaque ligne (Max) et les sommer (Sum).
+
+
+
+---
+
+### La synthèse pour tes collègues ingénieurs
+
+Si la question revient en review, tu peux répondre de façon très factuelle :
+
+> **"Dans la version `run_seek_ot_averaged`, on est sur un Bi-Encoder standard : on compresse la fenêtre en un vecteur moyen par `torch.mean`, puis on calcule une cosine similarity matricielle classique. Le MaxSim n'est ni utilisé ni applicable ici, car nous n'avons pas de représentations multi-vectorielles au niveau token comme c'est le cas avec ColBERT."**
