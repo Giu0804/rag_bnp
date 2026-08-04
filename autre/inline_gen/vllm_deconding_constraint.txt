@@ -1,0 +1,91 @@
+import pandas as pd
+from openai import OpenAI
+
+# 1. Connexion au serveur vLLM local
+client = OpenAI(
+    base_url="http://localhost:8000/v1", 
+    api_key="not-needed"
+)
+
+# 2. Ton Dataset (simulation, à remplacer par ton DataFrame chargé)
+data = [
+    {
+        "question": "What are the architectural specifications of the model?",
+        "contexts": [
+            {"id": 1, "text": "The Chess Transformer model has 960,756 parameters."},
+            {"id": 2, "text": "Vocabulary size is 3803 tokens with an embedding dimension of 92."},
+            {"id": 3, "text": "The architecture features 5 layers and 4 attention heads."},
+            {"id": 4, "text": "The best first-try legal rate is 69.3%."}
+        ],
+        "gold_ids": [1, 2, 3]
+    }
+]
+df_dataset = pd.DataFrame(data)
+
+# ==========================================
+# 3. TON SYSTEM PROMPT (Variable à travailler)
+# ==========================================
+SYSTEM_PROMPT = """You are a rigorous scientific research assistant. 
+Your task is to answer the question based EXCLUSIVELY on the provided documents.
+Strict Formatting Rules:
+- Write in fluid, academic-style sentences.
+- Each sentence (or group of closely related sentences) MUST end with one or more citations in the format [ID] or [ID1, ID2].
+- Do not invent any chunk IDs. Use only those provided in the context.
+- Do not add any introductory or concluding comments outside of the requested format."""
+
+results = []
+
+# 4. Boucle sur les samples du dataset
+for idx, row in df_dataset.iterrows():
+    question = row["question"]
+    chunks = row["contexts"]
+    gold_ids = row["gold_ids"]
+    
+    # Construction dynamique de la grammaire EBNF pour ce sample précis
+    active_ids = [str(c["id"]) for c in chunks]
+    ids_rule = " | ".join([f'"{i}"' for i in active_ids])
+    
+    dynamic_ebnf = f"""
+    id ::= {ids_rule}
+    citation_content ::= id (", " id)*
+    single_citation ::= "[" citation_content "]"
+    sentence_block ::= [^\\\[\\.\\n]+ "." (single_citation)+
+    root ::= sentence_block (" " sentence_block)*
+    """
+    
+    # Construction du User Prompt avec injection des chunks et de la question
+    context_str = "\n".join([f"[{c['id']}] {c['text']}" for c in chunks])
+    user_prompt = f"""Reference Documents:
+{context_str}
+
+Question: {question}
+Answer:"""
+
+    # 5. Appel Chat API avec la variable system prompt et le décodage contraint
+    response = client.chat.completions.create(
+        model="Qwen/Qwen2.5-27B-Instruct", # Adapte avec le nom exact de ton modèle sur vLLM
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature=0.0,
+        seed=42,
+        extra_body={
+            "guided_grammar": dynamic_ebnf
+        }
+    )
+    
+    generated_answer = response.choices[0].message.content.strip()
+    
+    # Enregistrement pour l'évaluation future
+    results.append({
+        "sample_id": idx,
+        "question": question,
+        "chunks": chunks,
+        "gold_ids": gold_ids,
+        "generated_answer": generated_answer
+    })
+
+# 6. DataFrame final des résultats
+df_results = pd.DataFrame(results)
+print(df_results.iloc[0]["generated_answer"])
