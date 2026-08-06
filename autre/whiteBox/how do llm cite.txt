@@ -1,0 +1,240 @@
+import torch
+import pandas as pd
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# ==========================================
+# 1. CHARGEMENT DU MODÈLE ET TOKENIZER
+# ==========================================
+model_id = "meta-llama/Llama-3.1-8B-Instruct"
+
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    low_cpu_mem_usage=True
+)
+
+# ==========================================
+# 2. FORMATAGE DU PROMPT AVEC TRACKING DES CHUNKS
+# ==========================================
+def format_prompt_with_tracking(question, chunks_list, tokenizer):
+    """
+    Formate le prompt et repère précisément les indices de début et de fin 
+    de chaque chunk dans le texte du prompt tokenisé.
+    """
+    system_prompt = "Tu es un assistant expert qui répond aux questions en te basant uniquement sur le contexte fourni."
+    
+    # On construit le texte du prompt en gardant la trace des chunks
+    chunks_text_parts = []
+    for c in chunks_list:
+        chunks_text_parts.append(f"[Chunk ID: {c['id']}] {c['text']}")
+    
+    contexte_assemble = "\n\n".join(chunks_text_parts)
+    user_prompt = f"Voici les documents :\n{contexte_assemble}\n\nQuestion : {question}"
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    
+    full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    # Tokenisation du prompt complet pour mapper les positions exactes
+    prompt_encoding = tokenizer(full_prompt, return_tensors="pt", add_special_tokens=False)
+    prompt_input_ids = prompt_encoding.input_ids[0]
+    
+    # Recherche des positions des tokens correspondants à chaque chunk dans le prompt
+    chunk_token_spans = {}
+    for c in chunks_list:
+        marker_str = f"[Chunk ID: {c['id']}]"
+        marker_ids = tokenizer(marker_str, add_special_tokens=False).input_ids
+        
+        # Recherche de la sous-séquence de tokens dans le prompt
+        start_idx = trouve_sous_sequence(prompt_input_ids.tolist(), marker_ids)
+        if start_idx is not None:
+            # Le span du chunk va de son ID jusqu'au début du chunk suivant (ou fin du texte du chunk)
+            # Pour faire simple, on englobe la taille du texte du chunk tokenisé
+            chunk_text_ids = tokenizer(c['text'], add_special_tokens=False).input_ids
+            end_idx = start_idx + len(marker_ids) + len(chunk_text_ids)
+            chunk_token_spans[c['id']] = (start_idx, min(end_idx, len(prompt_input_ids)))
+            
+    return full_prompt, prompt_encoding, chunk_token_spans
+
+def trouve_sous_sequence(sequence, sous_sequence):
+    """Fonction utilitaire pour retrouver l'index de début d'un chunk dans les IDs du prompt."""
+    L = len(sous_sequence)
+    for i in range(len(sequence) - L + 1):
+        if sequence[i:i+L] == sous_sequence:
+            return i
+    return None
+
+# ==========================================
+# 3. MOTEUR DE GÉNÉRATION ET EXTRACTION D'ATTENTION
+# ==========================================
+def generate_with_mechanistic_attribution(model, tokenizer, full_prompt_str, prompt_encoding, chunk_token_spans):
+    """
+    Génère la réponse tout en extrayant les poids d'attention croisée pour faire l'attribution inline.
+    """
+    inputs = prompt_encoding.to(model.device)
+    prompt_len = inputs.input_ids.shape[1]
+    
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=256,
+            do_sample=False,
+            output_attentions=True,
+            return_dict_in_generate=True
+        )
+        
+    generated_ids = outputs.sequences[0][prompt_len:]
+    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    
+    # outputs.attentions est un tuple (un par token généré) 
+    # Chaque élément du tuple est un tuple de couches (de 0 à L-1)
+    # Formet d'un tenseur d'attention : (batch_size, num_heads, seq_len_step, total_seq_len)
+    
+    token_attentions = outputs.attentions
+    attribution_mapping = []
+    
+    # On sélectionne les couches intermédiaires/tardives identifiées par le papier (ex: couches 15 à 30 sur Llama 8B)
+    # Par défaut, on peut moyenner sur la moitié supérieure des couches du modèle
+    total_layers = len(token_attentions[0])
+    target_layers = range(total_layers // 2, total_layers) 
+    
+    for step_idx, step_attns in enumerate(token_attentions):
+        current_token_id = generated_ids[step_idx].item()
+        current_token_str = tokenizer.decode([current_token_id])
+        
+        chunk_scores = {cid: 0.0 for cid in chunk_token_spans.keys()}
+        
+        # Pour chaque couche ciblée
+        for layer_idx in target_layers:
+            layer_attn = step_attns[layer_idx] # Shape: (1, num_heads, 1, total_seq_len)
+            # Moyenne sur les têtes d'attention (dim 1)
+            mean_heads_attn = layer_attn.mean(dim=1)[0, 0] # Shape: (total_seq_len)
+            
+            # Sommation de l'attention reçue sur les tokens de chaque chunk
+            for cid, (start, end) in chunk_token_spans.items():
+                if start < len(mean_heads_attn) and end <= len(mean_heads_attn):
+                    score_chunk = mean_heads_attn[start:end].sum().item()
+                    chunk_scores[cid] += score_chunk
+                    
+        # Trouver quel chunk a le score maximal pour ce token généré
+        if chunk_scores:
+            best_chunk_id = max(chunk_scores, key=chunk_scores.get)
+            max_score = chunk_scores[best_chunk_id]
+        else:
+            best_chunk_id = None
+            max_score = 0.0
+            
+        attribution_mapping.append({
+            "token_id": current_token_id,
+            "token": current_token_str,
+            "best_chunk_id": best_chunk_id,
+            "scores": chunk_scores
+        })
+        
+    return generated_text, attribution_mapping
+
+# ==========================================
+# 4. PIPELINE GLOBAL POUR LE DATAFRAME
+# ==========================================
+def run_mechanistic_inline_pipeline(df, model, tokenizer):
+    results = []
+    
+    for idx, row in df.iterrows():
+        question = row['question']
+        chunks_list = row['contexts'] # Format: [{"id": 0, "text": "..."}, {"id": 34, "text": "..."}]
+        
+        # 1. Préparation du prompt et des repères spatiaux des chunks
+        full_prompt, prompt_encoding, chunk_token_spans = format_prompt_with_tracking(
+            question, chunks_list, tokenizer
+        )
+        
+        # 2. Génération et calcul d'attribution par attention interne
+        generated_text, token_mapping = generate_with_mechanistic_attribution(
+            model, tokenizer, full_prompt, prompt_encoding, chunk_token_spans
+        )
+        
+        results.append({
+            "question": question,
+            "contexts": chunks_list,
+            "generated_answer": generated_text,
+            "token_mapping": token_mapping
+        })
+        
+    return pd.DataFrame(results)
+
+
+
+
+
+def build_cited_answer_from_mapping(token_mapping):
+    """
+    Transforme le token_mapping en texte fluide avec des balises [id] 
+    insérées à chaque changement de chunk ou fin de bloc.
+    """
+    if not token_mapping:
+        return ""
+    
+    spans = []
+    current_chunk_id = token_mapping[0]["best_chunk_id"]
+    current_tokens = []
+    
+    # 1. Regroupement des tokens contigus partageant le même chunk_id
+    for item in token_mapping:
+        chunk_id = item["best_chunk_id"]
+        token = item["token"]
+        
+        if chunk_id == current_chunk_id:
+            current_tokens.append(token)
+        else:
+            # On ferme le span précédent et on l'enregistre
+            spans.append({
+                "chunk_id": current_chunk_id,
+                "text": "".join(current_tokens)
+            })
+            # On initialise le nouveau span
+            current_chunk_id = chunk_id
+            current_tokens = [token]
+            
+    # Ne pas oublier d'ajouter le dernier span
+    if current_tokens:
+        spans.append({
+            "chunk_id": current_chunk_id,
+            "text": "".join(current_tokens)
+        })
+        
+    # 2. Reconstruction de la chaîne de caractères finale avec les balises [id]
+    final_parts = []
+    for span in spans:
+        text = span["text"]
+        cid = span["chunk_id"]
+        
+        if text.strip(): # On évite les spans vides
+            if cid is not None:
+                # On colle la balise de citation à la fin du span textuel
+                final_parts.append(f"{text} [{cid}]")
+            else:
+                final_parts.append(text)
+                
+    # On assemble le tout proprement
+    return " ".join(final_parts)
+
+
+
+# Application de la fonction sur chaque ligne du DataFrame de résultats
+df_res["cited_answer"] = df_res["token_mapping"].apply(build_cited_answer_from_mapping)
+
+
+
+for idx, row in df_res.iterrows():
+    print(f"📌 Question : {row['question']}")
+    print(f"💬 Réponse brute générée : {row['generated_answer']}")
+    print(f"🏷️ Réponse tracée & citée : {row['cited_answer']}")
+    print("-" * 50)
