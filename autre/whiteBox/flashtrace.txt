@@ -1,0 +1,186 @@
+import re
+import torch
+import pandas as pd
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from flashtrace import FlashTrace
+
+# ==========================================
+# 1. INITIALISATION (Modèle, Tokenizer et Tracer)
+# ==========================================
+model_id = "meta-llama/Llama-3.1-8B-Instruct"
+
+tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# Initialisation de FlashTrace (encapsule le modèle pour le suivi des gradients)
+tracer = FlashTrace(model_id, use_chat_template=False) 
+
+# ==========================================
+# 2. REPÉRAGE DES CHUNKS DANS LE PROMPT
+# ==========================================
+def format_prompt_with_tracking(question, chunks_list, tokenizer):
+    """
+    Construit le prompt et identifie les plages de tokens (start, end) 
+    de chaque chunk pour agréger les gradients plus tard.
+    """
+    system_prompt = "Tu es un assistant expert qui répond aux questions en te basant uniquement sur le contexte fourni."
+    
+    chunks_text_parts = []
+    for c in chunks_list:
+        chunks_text_parts.append(f"[Chunk ID: {c['id']}]\n{c['text']}")
+    
+    contexte_assemble = "\n\n".join(chunks_text_parts)
+    user_prompt = f"Voici les documents :\n{contexte_assemble}\n\nQuestion : {question}"
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    prompt_input_ids = tokenizer(full_prompt, add_special_tokens=False).input_ids
+    
+    chunk_token_spans = {}
+    current_search_idx = 0
+    
+    for c in chunks_list:
+        marker_str = f"[Chunk ID: {c['id']}]"
+        marker_ids = tokenizer(marker_str, add_special_tokens=False).input_ids
+        
+        # Recherche naïve de la sous-séquence (adaptée pour l'exemple)
+        start_idx = None
+        L = len(marker_ids)
+        for i in range(current_search_idx, len(prompt_input_ids) - L + 1):
+            if prompt_input_ids[i:i+L] == marker_ids:
+                start_idx = i
+                break
+                
+        if start_idx is not None:
+            chunk_text_ids = tokenizer(c['text'], add_special_tokens=False).input_ids
+            end_idx = start_idx + len(marker_ids) + len(chunk_text_ids)
+            chunk_token_spans[c['id']] = (start_idx, min(end_idx, len(prompt_input_ids)))
+            current_search_idx = end_idx
+            
+    return full_prompt, chunk_token_spans
+
+# ==========================================
+# 3. DÉCOUPAGE ROBUSTE DE LA RÉPONSE (Phrases & Listes)
+# ==========================================
+def get_sentence_spans_robust(generated_text, tokenizer):
+    """
+    Découpe le texte sur la ponctuation forte OU les sauts de ligne.
+    Retourne les segments de texte et leurs indices de tokens.
+    """
+    # Expression régulière : on coupe après un point/point d'exclamation/point d'interrogation 
+    # suivi d'un espace, OU à chaque saut de ligne (\n).
+    # L'utilisation des parenthèses garde les séparateurs pour reconstruire le texte fidèlement.
+    segments = re.split(r'((?<=[.!?])\s+|\n+)', generated_text.strip())
+    
+    spans = []
+    current_token_idx = 0
+    
+    # On reconstitue les blocs (texte + séparateur)
+    current_phrase = ""
+    
+    for seg in segments:
+        if not seg: continue
+        
+        # Si c'est un séparateur, on l'attache à la phrase en cours et on clôture le bloc
+        if re.match(r'^\s+$|^\n+$', seg):
+            current_phrase += seg
+            if current_phrase.strip():
+                tokens = tokenizer(current_phrase, add_special_tokens=False).input_ids
+                length = len(tokens)
+                
+                spans.append({
+                    "text": current_phrase,
+                    "span_indices": (current_token_idx, current_token_idx + length - 1)
+                })
+                current_token_idx += length
+            current_phrase = ""
+        else:
+            current_phrase += seg
+            
+    # Traitement du dernier bloc restant s'il ne finit pas par une ponctuation
+    if current_phrase.strip():
+        tokens = tokenizer(current_phrase, add_special_tokens=False).input_ids
+        length = len(tokens)
+        spans.append({
+            "text": current_phrase,
+            "span_indices": (current_token_idx, current_token_idx + length - 1)
+        })
+        
+    return spans
+
+# ==========================================
+# 4. PIPELINE D'ATTRIBUTION INLINE PAR GRADIENT
+# ==========================================
+def run_flashtrace_pipeline(df, tracer, tokenizer, model):
+    results = []
+    
+    for idx, row in df.iterrows():
+        question = row['question']
+        chunks_list = row['contexts']
+        
+        # 1. Formatage du prompt et cartographie spatiale des chunks
+        prompt_str, chunk_token_spans = format_prompt_with_tracking(question, chunks_list, tokenizer)
+        
+        # 2. Génération classique de la réponse brute
+        # (Ici, j'utilise une fonction fictive `generate_llama` représentant ta génération actuelle)
+        inputs = tokenizer(prompt_str, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            outputs = model.generate(**inputs, max_new_tokens=256, do_sample=False)
+        generated_answer = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+        
+        # 3. Découpage en spans logiques (gérant les listes et phrases)
+        sentence_spans = get_sentence_spans_robust(generated_answer, tokenizer)
+        
+        cited_sentences = []
+        
+        # 4. Évaluation causale via FlashTrace
+        for span in sentence_spans:
+            text_phrase = span["text"]
+            indices = span["span_indices"]
+            
+            # Si le span est trop petit (ex: juste un espace), on l'ajoute sans citation
+            if not text_phrase.strip():
+                cited_sentences.append(text_phrase)
+                continue
+                
+            # Appel à FlashTrace : cible un span spécifique de la réponse
+            trace = tracer.trace(
+                prompt=prompt_str,
+                target=generated_answer, 
+                output_span=indices 
+            )
+            
+            chunk_scores = {c['id']: 0.0 for c in chunks_list}
+            
+            # Agrégation des gradients pour chaque chunk
+            for cid, (start_idx, end_idx) in chunk_token_spans.items():
+                if start_idx < len(trace.scores):
+                    # On fait la somme des scores d'influence sur l'intervalle du chunk
+                    score = sum(trace.scores[start_idx:min(end_idx, len(trace.scores))])
+                    chunk_scores[cid] = float(score)
+            
+            # Identification du chunk le plus influent
+            best_chunk_id = max(chunk_scores, key=chunk_scores.get)
+            
+            # Nettoyage du texte pour l'affichage (on retire les sauts de ligne finaux pour insérer le tag avant)
+            clean_text = text_phrase.rstrip()
+            trailing_spaces = text_phrase[len(clean_text):]
+            
+            # Injection de la balise
+            cited_sentences.append(f"{clean_text} [{best_chunk_id}]{trailing_spaces}")
+            
+        # 5. Assemblage final
+        final_cited_answer = "".join(cited_sentences)
+        
+        results.append({
+            "question": question,
+            "generated_answer": generated_answer,
+            "cited_answer": final_cited_answer
+        })
+        
+    return pd.DataFrame(results)
