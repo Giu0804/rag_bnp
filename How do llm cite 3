@@ -1,0 +1,268 @@
+import torch
+import gc
+import pandas as pd
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# ==========================================
+# 1. CONFIGURATION ET PARAMÈTRES MÉCANISTES
+# ==========================================
+
+# Sélection des têtes tardives (Late-stage Mover Heads) responsables de l'extraction
+ATTRIBUTION_ENSEMBLE = [
+    (15, 8), (16, 4), (18, 12), (20, 5), (22, 10)
+]
+
+# Seuil d'attention cumulée pour déclencher une citation (permet les citations multiples)
+# À calibrer empiriquement (ex: entre 0.5 et 2.5)
+ATTENTION_THRESHOLD = 1.0 
+
+# ==========================================
+# 2. REPÉRAGE SPATIAL DES PARAGRAPHES
+# ==========================================
+
+def get_paragraph_token_spans(full_prompt_text, paragraphs_list, tokenizer):
+    """
+    Identifie les indices via une recherche de texte (robuste face au tokenizer Llama-3).
+    """
+    inputs = tokenizer(full_prompt_text, return_offsets_mapping=True, return_tensors="pt")
+    offsets = inputs.offset_mapping[0].tolist()
+    
+    token_spans = {}
+    
+    for p in paragraphs_list:
+        # Format exact défini dans run_citation_pipeline
+        marker_str = f"id {p['id']} | chunk {p['text']}"
+        
+        start_char = full_prompt_text.find(marker_str)
+        if start_char == -1:
+            print(f"⚠️ Paragraphe {p['id']} introuvable dans le prompt.")
+            continue 
+            
+        end_char = start_char + len(marker_str)
+        
+        start_token = None
+        end_token = None
+        
+        for idx, (tok_start, tok_end) in enumerate(offsets):
+            if tok_start <= start_char < tok_end and start_token is None:
+                start_token = idx
+            if tok_start < end_char <= tok_end:
+                end_token = idx
+                
+        if end_token is None:
+            end_token = len(offsets) - 1
+            
+        if start_token is not None:
+            token_spans[p['id']] = (start_token, end_token + 1)
+            
+    return token_spans
+
+# ==========================================
+# 3. GÉNÉRATION ET GESTION VRAM (OOM KILLER)
+# ==========================================
+
+def generate_with_attention(model, tokenizer, system_prompt, user_prompt):
+    """
+    Génère la réponse, extrait l'attention de l'Ensemble, et nettoie la VRAM immédiatement.
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    
+    full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(full_prompt, return_tensors="pt").to(model.device)
+    prompt_length = inputs.input_ids.shape[1]
+    
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs, 
+            max_new_tokens=256, 
+            do_sample=False,
+            output_attentions=True,
+            return_dict_in_generate=True
+        )
+        
+    generated_ids = outputs.sequences[0][prompt_length:]
+    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    
+    # --- EXTRACTION ET FILTRAGE POUR ÉVITER LE OOM ---
+    filtered_attentions = []
+    
+    for step_idx, step_attns in enumerate(outputs.attentions):
+        step_filtered = {}
+        for (layer_idx, head_idx) in ATTRIBUTION_ENSEMBLE:
+            layer_attn = step_attns[layer_idx]
+            
+            if layer_attn.shape[2] > 1: 
+                # Prefill : Attention du dernier token vers le reste du prompt
+                specific_head_attn = layer_attn[0, head_idx, -1, :]
+            else:
+                # Decoding : Le token généré (longueur 1) vers le reste
+                specific_head_attn = layer_attn[0, head_idx, 0, :]
+                
+            # Transfert strict sur CPU du vecteur isolé (taille = prompt_length)
+            attn_slice = specific_head_attn[:prompt_length].detach().cpu()
+            
+            if layer_idx not in step_filtered:
+                step_filtered[layer_idx] = {}
+            step_filtered[layer_idx][head_idx] = attn_slice
+            
+        filtered_attentions.append(step_filtered)
+        
+    # --- NETTOYAGE MASSIF DE LA VRAM ---
+    del outputs
+    del inputs
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    return generated_text, filtered_attentions, generated_ids, full_prompt
+
+# ==========================================
+# 4. MOTEUR D'ATTRIBUTION (MULTI-CITATIONS)
+# ==========================================
+
+def compute_attention_mapping_mechanistic(filtered_attentions, generated_ids, token_spans, tokenizer):
+    """
+    Évalue le score d'attention par token et permet les citations multiples (Threshold).
+    """
+    token_mapping = []
+    
+    for step_idx, step_attns in enumerate(filtered_attentions):
+        token_id = generated_ids[step_idx].item()
+        token_str = tokenizer.decode([token_id], skip_special_tokens=True)
+        
+        if not token_str: 
+            continue # Ignore les tokens spéciaux vides (ex: eot_id)
+        
+        paragraph_scores = {pid: 0.0 for pid in token_spans.keys()}
+        
+        for (layer_idx, head_idx) in ATTRIBUTION_ENSEMBLE:
+            specific_head_attn = step_attns[layer_idx][head_idx] 
+            
+            for pid, (start, end) in token_spans.items():
+                if start < len(specific_head_attn):
+                    score = specific_head_attn[start:min(end, len(specific_head_attn))].sum().item()
+                    paragraph_scores[pid] += score
+                    
+        # Logique de seuil : permet de capturer [1, 2] si deux textes sont fortement regardés
+        active_pids = [
+            pid for pid, score in paragraph_scores.items() 
+            if score > ATTENTION_THRESHOLD
+        ]
+        active_pids.sort()
+        
+        best_pids = tuple(active_pids) if active_pids else None
+        
+        token_mapping.append({
+            "token": token_str,
+            "best_pid": best_pids # Tuple de PIDs
+        })
+        
+    return token_mapping
+
+def build_cited_answer(token_mapping):
+    """
+    Regroupe les tokens successifs et formate les citations multiples.
+    """
+    if not token_mapping: return ""
+    spans = []
+    current_pid = token_mapping[0]["best_pid"]
+    current_tokens = []
+    
+    for item in token_mapping:
+        if item["best_pid"] == current_pid:
+            current_tokens.append(item["token"])
+        else:
+            spans.append({"pid": current_pid, "text": "".join(current_tokens)})
+            current_pid = item["best_pid"]
+            current_tokens = [item["token"]]
+            
+    if current_tokens:
+        spans.append({"pid": current_pid, "text": "".join(current_tokens)})
+        
+    final_parts = []
+    for span in spans:
+        if span["text"].strip():
+            if span["pid"] is not None:
+                # Formatage du tuple en string : (1, 2) -> "1, 2"
+                pids_str = ", ".join(str(p) for p in span["pid"])
+                final_parts.append(f"{span['text']} [{pids_str}]")
+            else:
+                final_parts.append(span["text"])
+                
+    return "".join(final_parts)
+
+# ==========================================
+# 5. PIPELINE PRINCIPAL (PROMPT ENGINEERING)
+# ==========================================
+
+def run_citation_pipeline(df, model, tokenizer, system_prompt, user_prompt_template):
+    """
+    Exécute le processus sur le DataFrame.
+    user_prompt_template doit contenir {context_text} et {question}.
+    """
+    results = []
+    
+    for idx, row in df.iterrows():
+        question = row['question']
+        paragraphs_list = row['contexts'] 
+        
+        # 1. Assemblage des contextes
+        context_parts = []
+        for p in paragraphs_list:
+            context_parts.append(f"id {p['id']} | chunk {p['text']}")
+        context_text = "\n".join(context_parts)
+        
+        # 2. Construction dynamique du prompt
+        user_prompt_full = user_prompt_template.format(
+            context_text=context_text, 
+            question=question
+        )
+        
+        # 3. Génération et extraction VRAM-safe
+        generated_answer, filtered_attentions, generated_ids, full_prompt = generate_with_attention(
+            model, tokenizer, system_prompt, user_prompt_full
+        )
+        
+        # 4. Positionnement
+        paragraph_spans = get_paragraph_token_spans(full_prompt, paragraphs_list, tokenizer)
+        
+        # 5. Calcul d'attribution Mechaniste
+        token_mapping = compute_attention_mapping_mechanistic(
+            filtered_attentions, generated_ids, paragraph_spans, tokenizer
+        )
+        
+        # 6. Assemblage final
+        final_cited_answer = build_cited_answer(token_mapping)
+        
+        # Sauvegarde
+        row_res = row.to_dict()
+        row_res["generated_answer"] = generated_answer
+        row_res["cited_answer"] = final_cited_answer
+        
+        results.append(row_res)
+        
+        # Double sécurité mémoire à chaque itération du dataset
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+    return pd.DataFrame(results)
+
+# ==========================================
+# EXEMPLE D'EXÉCUTION
+# ==========================================
+if __name__ == "__main__":
+    # Paramètres de test (à remplacer par tes vraies données)
+    # df = pd.read_csv("data.csv")
+    
+    sys_prompt = "You are an expert assistant. Answer strictly based on the provided documents."
+    usr_prompt_template = "Documents:\n{context_text}\n\nQuestion: {question}"
+    
+    # df_results = run_citation_pipeline(
+    #     df=df, 
+    #     model=model, 
+    #     tokenizer=tokenizer, 
+    #     system_prompt=sys_prompt, 
+    #     user_prompt_template=usr_prompt_template
+    # )
