@@ -3,17 +3,28 @@ import pandas as pd
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # ==========================================
-# 1. TES FONCTIONS DE BASE CUSTOMISABLES
+# 1. CONFIGURATION ET PARAMÈTRES MÉCANISTES
+# ==========================================
+
+# ⚠️ L'Attributional Ensemble : 
+# Selon le papier, seules quelques têtes d'attention spécifiques gèrent la citation.
+# Tu devras remplacer cette liste par les coordonnées exactes (Couche, Tête) 
+# identifiées pour Llama-3.1-8B (souvent dans les couches moyennes/tardives).
+ATTRIBUTION_ENSEMBLE = [
+    (15, 4), (18, 12), (20, 5), (22, 14) # Exemples fictifs à adapter
+]
+
+# ==========================================
+# 2. FORMATAGE DU PROMPT (Personnalisable)
 # ==========================================
 
 def format_prompt_fn(question, paragraphs_list):
     """
-    Construit le prompt en anglais, en utilisant la nomenclature 'Paragraph ID'.
-    Retourne system_prompt et user_prompt séparément, comme dans ton code.
+    Construit le prompt en anglais avec la nomenclature 'Paragraph ID'.
+    Retourne le system prompt et le user prompt séparément.
     """
     system_prompt = "You are an expert assistant. Answer the user's question based strictly on the provided paragraphs."
     
-    # Formatage en anglais avec la mention Paragraph ID
     context_parts = []
     for p in paragraphs_list:
         context_parts.append(f"[Paragraph ID: {p['id']}]\n{p['text']}")
@@ -23,13 +34,40 @@ def format_prompt_fn(question, paragraphs_list):
     
     return system_prompt, user_prompt
 
+def get_paragraph_token_spans(prompt_input_ids, paragraphs_list, tokenizer):
+    """
+    Identifie les indices de début et de fin de chaque paragraphe dans le prompt tokenisé.
+    """
+    token_spans = {}
+    current_search_idx = 0
+    prompt_list = prompt_input_ids.tolist()
+    
+    for p in paragraphs_list:
+        marker_str = f"[Paragraph ID: {p['id']}]"
+        marker_ids = tokenizer(marker_str, add_special_tokens=False).input_ids
+        
+        start_idx = None
+        L = len(marker_ids)
+        for i in range(current_search_idx, len(prompt_list) - L + 1):
+            if prompt_list[i:i+L] == marker_ids:
+                start_idx = i
+                break
+                
+        if start_idx is not None:
+            text_ids = tokenizer(p['text'], add_special_tokens=False).input_ids
+            end_idx = start_idx + len(marker_ids) + len(text_ids)
+            token_spans[p['id']] = (start_idx, min(end_idx, len(prompt_list)))
+            current_search_idx = end_idx
+            
+    return token_spans
+
+# ==========================================
+# 3. GÉNÉRATION ET EXTRACTION DE L'ATTENTION
+# ==========================================
 
 def generate_with_attention(model, tokenizer, system_prompt, user_prompt):
     """
-    Ton ancienne fonction 'generate_llama', mais avec 3 petites modifications :
-    1. output_attentions=True
-    2. return_dict_in_generate=True
-    3. On renvoie les tenseurs utiles pour la suite.
+    Génère la réponse en forçant le modèle à renvoyer sa matrice d'attention.
     """
     messages = [
         {"role": "system", "content": system_prompt},
@@ -45,79 +83,49 @@ def generate_with_attention(model, tokenizer, system_prompt, user_prompt):
             **inputs, 
             max_new_tokens=256, 
             do_sample=False,
-            output_attentions=True,          # <--- LE CHANGEMENT CLÉ EST ICI
-            return_dict_in_generate=True     # <--- ET ICI
+            output_attentions=True,          # Indispensable pour la théorie
+            return_dict_in_generate=True     # Indispensable pour récupérer l'objet proprement
         )
         
-    # Extraction de la réponse texte
     generated_ids = outputs.sequences[0][prompt_length:]
     generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
     
-    # On retourne le texte ET les données d'attention nécessaires au mapping
     return generated_text, outputs.attentions, inputs.input_ids[0], generated_ids
 
-
-
-
-
-
 # ==========================================
-# 2. LE MOTEUR D'ATTENTION INLINE (Les utilitaires)
+# 4. MOTEUR MATHÉMATIQUE (L'Application du Papier)
 # ==========================================
 
-def get_paragraph_token_spans(prompt_input_ids, paragraphs_list, tokenizer):
+def compute_attention_mapping_mechanistic(token_attentions, generated_ids, token_spans, tokenizer):
     """
-    Retrouve à quels indices de tokens correspond chaque paragraphe dans le prompt.
-    """
-    token_spans = {}
-    current_search_idx = 0
-    prompt_list = prompt_input_ids.tolist()
-    
-    for p in paragraphs_list:
-        marker_str = f"[Paragraph ID: {p['id']}]"
-        marker_ids = tokenizer(marker_str, add_special_tokens=False).input_ids
-        
-        # Recherche basique de la sous-séquence (le marqueur)
-        start_idx = None
-        L = len(marker_ids)
-        for i in range(current_search_idx, len(prompt_list) - L + 1):
-            if prompt_list[i:i+L] == marker_ids:
-                start_idx = i
-                break
-                
-        if start_idx is not None:
-            # On englobe la longueur du texte du paragraphe
-            text_ids = tokenizer(p['text'], add_special_tokens=False).input_ids
-            end_idx = start_idx + len(marker_ids) + len(text_ids)
-            token_spans[p['id']] = (start_idx, min(end_idx, len(prompt_list)))
-            current_search_idx = end_idx
-            
-    return token_spans
-
-def compute_attention_mapping(token_attentions, generated_ids, token_spans, tokenizer):
-    """
-    Croise la matrice d'attention et les spans pour savoir, pour chaque token, 
-    quel paragraphe est le plus regardé.
+    Calcule le score de chaque paragraphe en sommant UNIQUEMENT l'attention 
+    des têtes définies dans l'Attributional Ensemble.
     """
     token_mapping = []
-    total_layers = len(token_attentions[0])
-    target_layers = range(total_layers // 2, total_layers) # Couches tardives
     
+    # token_attentions contient un tuple par token généré
     for step_idx, step_attns in enumerate(token_attentions):
         token_id = generated_ids[step_idx].item()
         token_str = tokenizer.decode([token_id])
         
+        # Initialisation des scores pour ce token
         paragraph_scores = {pid: 0.0 for pid in token_spans.keys()}
         
-        for layer_idx in target_layers:
-            layer_attn = step_attns[layer_idx] # (1, num_heads, 1, total_seq_len)
-            mean_heads_attn = layer_attn.mean(dim=1)[0, 0] # (total_seq_len)
+        # Application stricte de la théorie : on ne lit QUE les têtes causales
+        for (layer_idx, head_idx) in ATTRIBUTION_ENSEMBLE:
+            # step_attns[layer_idx] shape : (batch=1, num_heads, seq_len_step=1, total_prompt_len)
+            layer_attn = step_attns[layer_idx]
             
+            # On isole le vecteur d'attention de la tête spécifique
+            specific_head_attn = layer_attn[0, head_idx, 0, :] 
+            
+            # Sommation de l'attention sur la plage de tokens de chaque paragraphe
             for pid, (start, end) in token_spans.items():
-                if start < len(mean_heads_attn):
-                    score = mean_heads_attn[start:min(end, len(mean_heads_attn))].sum().item()
+                if start < len(specific_head_attn):
+                    score = specific_head_attn[start:min(end, len(specific_head_attn))].sum().item()
                     paragraph_scores[pid] += score
                     
+        # Le paragraphe ayant reçu le plus d'attention de cet ensemble gagne
         best_pid = max(paragraph_scores, key=paragraph_scores.get) if paragraph_scores else None
         
         token_mapping.append({
@@ -128,7 +136,10 @@ def compute_attention_mapping(token_attentions, generated_ids, token_spans, toke
     return token_mapping
 
 def build_cited_answer(token_mapping):
-    """ Transforme le mapping de tokens en texte lisible avec balises [ID]. """
+    """
+    Regroupe les tokens successifs pointant vers le même paragraphe (Span Merging)
+    et injecte la balise [ID].
+    """
     if not token_mapping: return ""
     spans = []
     current_pid = token_mapping[0]["best_pid"]
@@ -148,64 +159,51 @@ def build_cited_answer(token_mapping):
     final_parts = []
     for span in spans:
         if span["text"].strip():
-            final_parts.append(f"{span['text']} [{span['pid']}]" if span["pid"] is not None else span["text"])
-            
-    return "".join(final_parts) # On joint sans espace car les tokens de Llama gèrent déjà l'espacement
-
-
-
-
-
-
-
+            if span["pid"] is not None:
+                final_parts.append(f"{span['text']} [{span['pid']}]")
+            else:
+                final_parts.append(span["text"])
+                
+    return "".join(final_parts)
 
 # ==========================================
-# 3. PIPELINE SUR LE DATAFRAME (Le coeur du loop)
+# 5. LA BOUCLE SUR TON DATAFRAME
 # ==========================================
 
-def run_mechanistic_pipeline(df, model, tokenizer, format_prompt_fn):
+def run_citation_pipeline(df, model, tokenizer):
+    """
+    Fonction principale à appeler avec ton DataFrame.
+    """
     results = []
     
-    # Comme dans ton LOO, on boucle sur chaque sample de ton dataset
     for idx, row in df.iterrows():
         question = row['question']
         paragraphs_list = row['contexts'] 
         
-        # 1. Appel de TA fonction de formatage (system et user séparés)
+        # 1. Formatage
         system_prompt, user_prompt = format_prompt_fn(question, paragraphs_list)
         
-        # 2. Génération unique (plus besoin de boucler sur les chunks comme pour le LOO !)
+        # 2. Génération et capture de l'attention
         generated_answer, token_attentions, prompt_input_ids, generated_ids = generate_with_attention(
             model, tokenizer, system_prompt, user_prompt
         )
         
-        # 3. On repère où sont les paragraphes dans le prompt
+        # 3. Positionnement spatial des paragraphes
         paragraph_spans = get_paragraph_token_spans(prompt_input_ids, paragraphs_list, tokenizer)
         
-        # 4. On extrait l'attribution via l'attention
-        token_mapping = compute_attention_mapping(
+        # 4. Attribution selon l'Attributional Ensemble
+        token_mapping = compute_attention_mapping_mechanistic(
             token_attentions, generated_ids, paragraph_spans, tokenizer
         )
         
-        # 5. On formate joliment avec les balises [ID] pour la traçabilité
+        # 5. Construction de la réponse finale avec balises
         final_cited_answer = build_cited_answer(token_mapping)
         
-        # On enregistre le tout
-        # Tu peux aussi utiliser row.to_dict() pour conserver tes autres colonnes
-        results.append({
-            "question": question,
-            "paragraphs": paragraphs_list,
-            "generated_answer": generated_answer,
-            "cited_answer": final_cited_answer
-        })
+        # On sauvegarde toutes les colonnes d'origine et on ajoute les nouvelles
+        row_res = row.to_dict()
+        row_res["generated_answer"] = generated_answer
+        row_res["cited_answer"] = final_cited_answer
+        
+        results.append(row_res)
         
     return pd.DataFrame(results)
-
-
-
-
-
-
-
-
-
