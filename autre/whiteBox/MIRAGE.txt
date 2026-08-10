@@ -217,3 +217,252 @@ def run_mirage_pipeline(df, model, tokenizer):
         torch.cuda.empty_cache()
         
     return pd.DataFrame(results)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+######################################################################################################"""
+NOUVELLE VERSION 
+
+
+
+
+import torch
+import torch.nn.functional as F
+import pandas as pd
+import gc
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# ==========================================
+# 1. PARAMÈTRES MIRAGE (SEUILS)
+# ==========================================
+
+CTI_THRESHOLD = 0.10  # Seuil de déclenchement du forçage de contexte
+CCI_THRESHOLD = 0.05  # Seuil d'attribution (Désormais un % normalisé !)
+
+# ==========================================
+# 2. PRÉPARATION DU PROMPT ET DES SPANS
+# ==========================================
+
+def prepare_mirage_prompts(tokenizer, question, paragraphs_list, custom_system_prompt):
+    # 1. Prompt sans contexte (Mémoire interne)
+    messages_no_ctx = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": f"Question: {question}"}
+    ]
+    prompt_no_ctx = tokenizer.apply_chat_template(messages_no_ctx, tokenize=False, add_generation_prompt=True)
+    
+    # 2. Prompt avec contexte (RAG)
+    context_parts = [f"id {p['id']} | chunk {p['text']}" for p in paragraphs_list]
+    context_text = "\n".join(context_parts)
+    
+    messages_ctx = [
+        {"role": "system", "content": custom_system_prompt},
+        {"role": "user", "content": f"Documents:\n{context_text}\n\nQuestion: {question}"}
+    ]
+    prompt_ctx = tokenizer.apply_chat_template(messages_ctx, tokenize=False, add_generation_prompt=True)
+    
+    return prompt_ctx, prompt_no_ctx
+
+
+def get_paragraph_token_spans(prompt_text, paragraphs_list, tokenizer):
+    inputs = tokenizer(prompt_text, return_offsets_mapping=True, return_tensors="pt")
+    offsets = inputs.offset_mapping[0].tolist()
+    token_spans = {}
+    
+    search_start = 0 
+    
+    for p in paragraphs_list:
+        marker_str = f"id {p['id']} | chunk {p['text']}"
+        start_char = prompt_text.find(marker_str, search_start)
+        if start_char == -1: continue
+            
+        end_char = start_char + len(marker_str)
+        search_start = end_char
+        
+        start_token, end_token = None, None
+        
+        for idx, (tok_start, tok_end) in enumerate(offsets):
+            if tok_start <= start_char < tok_end and start_token is None:
+                start_token = idx
+            if tok_start < end_char <= tok_end:
+                end_token = idx
+                
+        if end_token is None: end_token = len(offsets) - 1
+        if start_token is not None:
+            token_spans[p['id']] = (start_token, end_token + 1)
+            
+    return token_spans
+
+# ==========================================
+# 3. BOUCLE DE GÉNÉRATION MIRAGE OPTIMISÉE
+# ==========================================
+
+def generate_mirage(model, tokenizer, question, paragraphs_list, custom_system_prompt, max_new_tokens=256):
+    prompt_ctx, prompt_no_ctx = prepare_mirage_prompts(tokenizer, question, paragraphs_list, custom_system_prompt)
+    
+    inputs_ctx = tokenizer(prompt_ctx, return_tensors="pt").to(model.device)
+    inputs_no_ctx = tokenizer(prompt_no_ctx, return_tensors="pt").to(model.device)
+    spans = get_paragraph_token_spans(prompt_ctx, paragraphs_list, tokenizer)
+    
+    generated_ids = []
+    final_text_parts = []
+    citation_buffer = set()
+    
+    word_embeddings = model.get_input_embeddings()
+    
+    accumulated_input_ids_ctx = inputs_ctx.input_ids.clone()
+    
+    current_input_ids_ctx = inputs_ctx.input_ids
+    current_input_ids_no_ctx = inputs_no_ctx.input_ids
+    
+    past_key_values_ctx = None
+    past_key_values_no_ctx = None
+
+    stop_tokens = [tokenizer.eos_token_id]
+    if hasattr(tokenizer, "additional_special_tokens_ids") and tokenizer.additional_special_tokens_ids:
+        stop_tokens.extend(tokenizer.additional_special_tokens_ids)
+    
+    # MODE RAPIDE GLOBAL
+    with torch.no_grad():
+        for step in range(max_new_tokens):
+            
+            # Forward rapide (KV Cache)
+            outputs_ctx = model(input_ids=current_input_ids_ctx, past_key_values=past_key_values_ctx, use_cache=True)
+            outputs_no_ctx = model(input_ids=current_input_ids_no_ctx, past_key_values=past_key_values_no_ctx, use_cache=True)
+            
+            past_key_values_ctx = outputs_ctx.past_key_values
+            past_key_values_no_ctx = outputs_no_ctx.past_key_values
+            
+            logits_ctx = outputs_ctx.logits[0, -1, :]
+            logits_no_ctx = outputs_no_ctx.logits[0, -1, :]
+            
+            probs_ctx = F.softmax(logits_ctx, dim=-1)
+            probs_no_ctx = F.softmax(logits_no_ctx, dim=-1)
+            
+            next_token_id = torch.argmax(logits_ctx).item()
+            
+            if next_token_id in stop_tokens:
+                break
+                
+            # ÉTAPE 1: CTI
+            p_with = probs_ctx[next_token_id].item()
+            p_without = probs_no_ctx[next_token_id].item()
+            prob_shift = p_with - p_without
+            
+            # ========================================================
+            # ÉTAPE 2: CCI - EXÉCUTÉ UNIQUEMENT SI CTI EST DÉCLENCHÉ
+            # ========================================================
+            if prob_shift > CTI_THRESHOLD:
+                # Activation temporaire des gradients
+                with torch.enable_grad():
+                    embeds_ctx = word_embeddings(accumulated_input_ids_ctx).detach()
+                    embeds_ctx.requires_grad = True 
+                    
+                    # OPTIMISATION 1 : Pas de KV cache, pas d'attentions/hidden_states
+                    full_outputs = model(
+                        inputs_embeds=embeds_ctx, 
+                        use_cache=False,
+                        output_attentions=False,
+                        output_hidden_states=False
+                    )
+                    
+                    # On isole juste le logit cible
+                    target_logit = full_outputs.logits[0, -1, next_token_id]
+                    
+                    # OPTIMISATION 2 : On supprime immédiatement les outputs complets de la VRAM
+                    del full_outputs 
+                    
+                    # OPTIMISATION 3 : set_to_none libère la mémoire au lieu de mettre à 0
+                    model.zero_grad(set_to_none=True) 
+                    
+                    target_logit.backward()
+                    
+                    saliency_scores = embeds_ctx.grad[0].norm(p=2, dim=-1)
+                    
+                    raw_scores = {}
+                    total_saliency = 0
+                    
+                    for pid, (start, end) in spans.items():
+                        if start < len(saliency_scores):
+                            score = saliency_scores[start:min(end, len(saliency_scores))].sum().item()
+                            raw_scores[pid] = score
+                            total_saliency += score
+                    
+                    if total_saliency > 0:
+                        for pid, score in raw_scores.items():
+                            norm_score = score / total_saliency
+                            if norm_score > CCI_THRESHOLD:
+                                citation_buffer.add(pid)
+                                
+                    # OPTIMISATION 4 : Nettoyage immédiat post-backward
+                    del embeds_ctx, target_logit, saliency_scores
+
+            # --- GESTION DU TEXTE ---
+            token_str = tokenizer.decode([next_token_id])
+            final_text_parts.append(token_str)
+            
+            if token_str.strip() in [".", "!", "?", "\n"] and len(citation_buffer) > 0:
+                sorted_citations = sorted(list(citation_buffer))
+                citations_str = f" [{', '.join(map(str, sorted_citations))}]"
+                final_text_parts[-1] = final_text_parts[-1].replace(token_str.strip(), f"{citations_str}{token_str.strip()}")
+                citation_buffer.clear()
+                
+            current_input_ids_ctx = torch.tensor([[next_token_id]], device=model.device)
+            current_input_ids_no_ctx = torch.tensor([[next_token_id]], device=model.device)
+            
+            accumulated_input_ids_ctx = torch.cat([accumulated_input_ids_ctx, current_input_ids_ctx], dim=-1)
+            
+            del outputs_ctx, outputs_no_ctx, logits_ctx, logits_no_ctx
+
+    if len(citation_buffer) > 0:
+        sorted_citations = sorted(list(citation_buffer))
+        final_text_parts.append(f" [{', '.join(map(str, sorted_citations))}]")
+        
+    return "".join(final_text_parts)
+
+# ==========================================
+# 4. EXÉCUTION SUR PANDAS
+# ==========================================
+
+def run_mirage_pipeline(df, model, tokenizer, custom_system_prompt):
+    results = []
+    
+    # Sécurité globale : désactiver le gradient sur la boucle externe
+    with torch.no_grad():
+        for idx, row in df.iterrows():
+            question = row['question']
+            paragraphs_list = row['contexts'] 
+            
+            cited_answer = generate_mirage(
+                model, tokenizer, question, paragraphs_list, custom_system_prompt
+            )
+            
+            row_res = row.to_dict()
+            row_res["cited_answer"] = cited_answer
+            results.append(row_res)
+            
+            # Nettoyage profond entre chaque ligne
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+    return pd.DataFrame(results)
+
+# Rappel pour l'initialisation du modèle :
+# Assurez-vous de charger le modèle avec :
+# torch_dtype=torch.bfloat16 (ou float16)
+# attn_implementation="flash_attention_2"
