@@ -1,0 +1,93 @@
+import numpy as np
+import pandas as pd
+
+def run_llm_judge_precision_review(df, client, model_name="meta-llama/Meta-Llama-3.1-8B-Instruct"):
+    """
+    Vérifie la précision des citations via un petit LLM-as-a-judge (NLI binaire).
+    Conserve exactement le même format que 'inline_processed' dans 'precision_review'.
+    """
+    df_copy = df.copy()
+    reviewed_rows = []
+    
+    for idx, row in df_copy.iterrows():
+        inline_data = row.get('inline_processed', [])
+        contexts = row.get('contexts', [])
+        
+        if inline_data is None or len(inline_data) == 0:
+            reviewed_rows.append([])
+            continue
+            
+        # Création du dictionnaire de correspondance id -> text pour les chunks de ce sample
+        context_map = {c['id']: c['text'] for c in contexts if isinstance(c, dict) and 'id' in c}
+        
+        reviewed_snippets = []
+        for snippet in inline_data:
+            if not isinstance(snippet, dict):
+                continue
+                
+            sid = snippet.get('snippet_id')
+            snippet_text = snippet.get('text', "")
+            citations = snippet.get('citations', [])
+            
+            if citations is None:
+                citations = []
+                
+            filtered_citations = []
+            
+            for cit_id in citations:
+                # Si l'ID cité n'existe pas dans les chunks de référence, on l'élimine
+                if cit_id not in context_map:
+                    continue
+                    
+                chunk_text = context_map[cit_id]
+                
+                # Prompt système strict pour le juge binaire
+                system_msg = "You are a strict citation auditor. Answer only with YES or NO."
+                user_msg = f"""Does the provided chunk text logically entail or directly support the following statement?
+Statement: "{snippet_text}"
+Chunk Text: "{chunk_text}"
+Answer (YES or NO):"""
+
+                # Appel au LLM Judge avec décodage contraint par Regex (garantit un retour strict YES ou NO)
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": user_msg}
+                    ],
+                    temperature=0.0,
+                    max_tokens=5,
+                    extra_body={
+                        "guided_regex": "YES|NO"
+                    }
+                )
+                
+                answer = response.choices[0].message.content.strip().upper()
+                
+                # Si le juge valide par YES, on conserve l'ID de citation
+                if "YES" in answer:
+                    filtered_citations.append(cit_id)
+            
+            # Reconstruction rigoureuse du snippet avec le format initial
+            new_snippet = {
+                'snippet_id': sid,
+                'text': snippet_text,
+                'citations': np.array(filtered_citations) if isinstance(citations, np.ndarray) else filtered_citations
+            }
+            reviewed_snippets.append(new_snippet)
+            
+        reviewed_rows.append(reviewed_snippets)
+        
+    # Stockage dans la colonne demandée avec le format exact
+    df_copy['precision_review'] = reviewed_rows
+    return df_copy
+
+
+# Assurez-vous que votre client OpenAI pointe bien vers votre serveur vLLM (ou l'instance du petit modèle)
+reviewed_df = run_llm_judge_precision_review(
+    df=inline_df, 
+    client=client, 
+    model_name="meta-llama/Meta-Llama-3.1-8B-Instruct"
+)
+
+# Vous obtiendrez votre colonne : reviewed_df['precision_review']
