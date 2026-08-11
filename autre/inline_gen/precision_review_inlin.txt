@@ -1,0 +1,122 @@
+import torch
+from tqdm import tqdm
+import numpy as np
+import pandas as pd
+
+def run_bge_reranker_precision_review(df, model, tokenizer, score_threshold=0.5, batch_size=128):
+    """
+    Analyse les citations de chaque snippet dans 'inline_processed' à l'aide d'un Reranker.
+    Conserve TOUS les snippets, mais filtre la liste 'citations' pour ne garder 
+    que celles dont le score BGE est >= score_threshold.
+    """
+    df_copy = df.copy()
+    
+    # --- STEP 1: FLATTENING (Récupération de toutes les paires [phrase, chunk] à évaluer) ---
+    all_pairs = []
+    mapping = [] # Pour stocker la traçabilité : (row_idx, sid, cit_id)
+    
+    for idx, row in df_copy.iterrows():
+        inline_data = row.get('inline_processed', [])
+        contexts = row.get('contexts', [])
+        
+        if inline_data is None or len(inline_data) == 0:
+            continue
+            
+        # Création du dictionnaire id -> text pour les chunks de cette ligne
+        context_map = {c['id']: c['text'] for c in contexts if isinstance(c, dict) and 'id' in c}
+        
+        for snippet in inline_data:
+            if not isinstance(snippet, dict): 
+                continue
+                
+            sid = snippet.get('snippet_id')
+            citations = snippet.get('citations', [])
+            
+            if citations is None: 
+                continue
+                
+            for cit_id in citations:
+                # Si le cit_id existe bien dans les chunks de référence
+                if cit_id in context_map:
+                    snippet_text = snippet.get('text', "")
+                    chunk_text = context_map[cit_id]
+                    
+                    # Le Reranker prend une paire [Requête/Phrase, Document/Chunk]
+                    all_pairs.append([snippet_text, chunk_text])
+                    mapping.append((idx, sid, cit_id))
+
+    # --- STEP 2: MASSIVE BATCH INFERENCE ---
+    if not all_pairs:
+        print("Aucune paire à évaluer.")
+        df_copy['precision_review'] = df_copy['inline_processed']
+        return df_copy
+
+    all_scores = []
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.eval()
+
+    for i in tqdm(range(0, len(all_pairs), batch_size), desc="BGE Reranker Inference"):
+        batch_pairs = all_pairs[i : i + batch_size]
+        
+        # Tokenisation pour le cross-encoder (BGE-reranker)
+        inputs = tokenizer(
+            batch_pairs, 
+            padding=True, 
+            truncation=True, 
+            return_tensors='pt', 
+            max_length=512
+        ).to(device)
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+            # Récupération du score brut (logit)
+            logits = outputs.logits.view(-1).float().cpu().numpy()
+            all_scores.extend(logits)
+
+    # --- STEP 3: SCORE MAPPING (Création d'un dictionnaire de lookup propre) ---
+    # Structure : score_lookup[(row_idx, sid, cit_id)] = score
+    score_lookup = {}
+    for (row_idx, sid, cit_id), score_val in zip(mapping, all_scores):
+        score_lookup[(row_idx, sid, cit_id)] = float(score_val)
+
+    # --- STEP 4: FINAL ASSEMBLY (Filtrage par seuil) ---
+    def review_snippets(row):
+        idx = row.name # Index unique de la ligne dans le DataFrame
+        inline_data = row.get('inline_processed', [])
+        
+        if inline_data is None or len(inline_data) == 0:
+            return []
+
+        reviewed_list = []
+        for snippet in inline_data:
+            if not isinstance(snippet, dict): 
+                continue
+                
+            sid = snippet.get('snippet_id')
+            original_citations = snippet.get('citations', [])
+            
+            if original_citations is None:
+                filtered_citations = []
+            else:
+                filtered_citations = []
+                for cit_id in original_citations:
+                    # On va chercher le score calculé pour ce triplet précis
+                    # Si non trouvé (ex: ID fantôme), on met un score par défaut très bas (-999)
+                    score = score_lookup.get((idx, sid, cit_id), -999.0)
+                    
+                    if score >= score_threshold:
+                        filtered_citations.append(cit_id)
+
+            # Reconstruction du snippet avec les citations filtrées
+            new_snippet = {
+                'snippet_id': sid,
+                'text': snippet.get('text', ""),
+                'citations': np.array(filtered_citations)
+            }
+            reviewed_list.append(new_snippet)
+            
+        return reviewed_list
+
+    # Application de la révision sur le DataFrame
+    df_copy['precision_review'] = df_copy.apply(review_snippets, axis=1)
+    return df_copy
