@@ -1,0 +1,204 @@
+import pandas as pd
+from openai import OpenAI
+
+def get_client():
+    """Crée et retourne le client OpenAI configuré pour vLLM en local."""
+    return OpenAI(
+        base_url="http://localhost:8000/v1",  # URL de ton serveur vLLM local
+        api_key="token-abc123"             # Clé factice requise par vLLM
+    )
+
+def generate_qwen_answer(client, system_prompt: str, user_prompt: str, model_name: str = "Qwen/Qwen2.5-27B-Instruct") -> str:
+    """
+    Interroge Qwen en appliquant un décodage contraint par regex pour garantir 
+    le format strict sous forme de tirets.
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    
+    # Regex stricte : force chaque ligne à commencer par "- " suivi du texte, sans texte superflu autour.
+    atomic_format_regex = r"(- [^\n]+\n?)+"
+
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        temperature=0.1,  # Température basse pour un comportement logique et stable
+        extra_body={
+            "guided_regex": atomic_format_regex
+        }
+    )
+    
+    return response.choices[0].message.content.strip()
+
+def run_pipeline(df: pd.DataFrame, text_column: str = "generated_answer") -> pd.DataFrame:
+    """
+    Parcourt le DataFrame, extrait les faits atomiques pour chaque ligne 
+    et retourne une copie du DataFrame avec la nouvelle colonne 'atomic_claims'.
+    """
+    client = get_client()
+    
+    # System prompt en anglais pour une performance maximale de Qwen sur la logique
+    system_prompt = (
+        "You are an expert in text analysis and logical decomposition. "
+        "Your task is to break down the provided text into atomic facts. "
+        "An atomic fact is the smallest possible independent unit of information that can be verified as true or false. "
+        "Rules to follow:\n"
+        "1. Deconstruct complex sentences into multiple simple, self-contained facts.\n"
+        "2. Do not omit any crucial information from the original text.\n"
+        "3. Every single fact must start strictly with a dash and a space ('- ') on a new line.\n"
+        "4. Do not include any introductory or concluding text (e.g., no 'Here are the facts:')."
+    )
+    
+    atomic_claims = []
+    
+    print("Début du traitement du pipeline...")
+    for idx, row in df.iterrows():
+        # User prompt contenant la réponse à analyser
+        user_prompt = f"Extract the atomic facts from the following text:\n{row[text_column]}"
+        
+        try:
+            result = generate_qwen_answer(client, system_prompt, user_prompt)
+            atomic_claims.append(result)
+        except Exception as e:
+            print(f"Erreur à la ligne {idx}: {e}")
+            atomic_claims.append("")  # Valeur vide par sécurité en cas d'erreur
+            
+    # Création de la copie du DataFrame avec la nouvelle colonne
+    df_copy = df.copy()
+    df_copy["atomic_claims"] = atomic_claims
+    return df_copy
+
+# --- Exemple d'utilisation rapide ---
+if __name__ == "__main__":
+    # Petit DataFrame de test simulé
+    data = {
+        "generated_answer": [
+            "Marie Curie was a physicist and chemist who conducted pioneering research on radioactivity. She was the first woman to win a Nobel Prize.",
+            "The Eiffel Tower is located in Paris, France. It was constructed in 1889 as the entrance to the 1889 World's Fair."
+        ]
+    }
+    df_test = pd.DataFrame(data)
+    
+    # Lancement du pipeline (assure-toi que ton serveur vLLM tourne en local sur le port 8000)
+    # df_result = run_pipeline(df_test)
+    # print(df_result["atomic_claims"].iloc[0])
+
+
+
+
+import pandas as pd
+from openai import OpenAI
+
+def get_client():
+    """Crée et retourne le client OpenAI configuré pour vLLM en local."""
+    return OpenAI(
+        base_url="http://localhost:8000/v1",
+        api_key="token-abc123"
+    )
+
+def generate_qwen_answer(client, system_prompt: str, user_prompt: str, model_name: str = "Qwen/Qwen2.5-27B-Instruct") -> str:
+    """
+    Interroge Qwen avec décodage contraint par regex pour forcer le format en tirets.
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    
+    atomic_format_regex = r"(- [^\n]+\n?)+"
+
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        temperature=0.1,
+        extra_body={
+            "guided_regex": atomic_format_regex
+        }
+    )
+    
+    return response.choices[0].message.content.strip()
+
+def run_nested_atomic_pipeline(df: pd.DataFrame, source_column: str = "inline_processed") -> pd.DataFrame:
+    """
+    Parcourt le DataFrame et les snippets imbriqués pour extraire les faits atomiques 
+    de chaque bloc textuel.
+    """
+    client = get_client()
+    
+    system_prompt = (
+        "You are an expert in text analysis and logical decomposition. "
+        "Your task is to break down the provided text snippet into atomic facts. "
+        "An atomic fact is the smallest possible independent unit of information. "
+        "Rules to follow:\n"
+        "1. Deconstruct complex sentences into multiple simple, self-contained facts.\n"
+        "2. Do not omit any crucial information from the original text.\n"
+        "3. Every single fact must start strictly with a dash and a space ('- ') on a new line.\n"
+        "4. Do not include any introductory or concluding text."
+    )
+    
+    new_atomic_claim_blocs = []
+    
+    print("Début du traitement du pipeline imbriqué...")
+    for idx, row in df.iterrows():
+        snippets_list = row[source_column]
+        new_snippets_list = []
+        
+        # 1ère boucle : on parcourt chaque sample
+        # 2ème boucle : on parcourt chaque snippet du sample
+        for snippet in snippets_list:
+            snippet_id = snippet.get("snippet_id")
+            snippet_text = snippet.get("text", "")
+            citations = snippet.get("citations", [])
+            
+            # Si le texte du snippet est vide, on évite l'appel inutile
+            if not snippet_text.strip():
+                formatted_atomic_claims = ""
+            else:
+                user_prompt = f"Extract the atomic facts from this text snippet:\n{snippet_text}"
+                try:
+                    formatted_atomic_claims = generate_qwen_answer(client, system_prompt, user_prompt)
+                except Exception as e:
+                    print(f"Erreur à la ligne {idx}, snippet {snippet_id}: {e}")
+                    formatted_atomic_claims = ""
+            
+            # Reconstruction du dictionnaire avec le texte remplacé par les faits atomiques
+            new_snippet = {
+                "snippet_id": snippet_id,
+                "text": formatted_atomic_claims,
+                "citations": citations
+            }
+            new_snippets_list.append(new_snippet)
+            
+        new_atomic_claim_blocs.append(new_snippets_list)
+            
+    # Création d'une copie du DataFrame avec la nouvelle colonne
+    df_copy = df.copy()
+    df_copy["atomic_claim_bloc"] = new_atomic_claim_blocs
+    return df_copy
+
+
+
+
+import pandas as pd
+
+def create_answer_wo_citations(df: pd.DataFrame, source_column: str = "inline_processed") -> pd.DataFrame:
+    """
+    Parcourt le DataFrame et concatène les textes des snippets (qui sont déjà sans citations) 
+    pour créer la colonne 'answer_wo_citations'.
+    """
+    answers_without_citations = []
+    
+    for idx, row in df.iterrows():
+        snippets_list = row[source_column]
+        
+        # Concaténation directe de tous les textes des snippets du sample
+        full_text = " ".join([snippet.get("text", "") for snippet in snippets_list])
+        
+        # Nettoyage des espaces superflus éventuels
+        answers_without_citations.append(full_text.strip())
+        
+    df_copy = df.copy()
+    df_copy["answer_wo_citations"] = answers_without_citations
+    return df_copy
