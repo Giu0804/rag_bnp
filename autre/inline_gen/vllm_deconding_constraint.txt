@@ -89,3 +89,41 @@ Answer:"""
 # 6. DataFrame final des résultats
 df_results = pd.DataFrame(results)
 print(df_results.iloc[0]["generated_answer"])
+
+
+
+
+
+
+#################################""
+nouveau ebnf : def generate_inline_chose(data, system_prompt):
+    results = []
+
+    # 4. Boucle sur les samples du dataset
+    for idx, row in data.iterrows():
+        question = row["question"]
+        chunks = row["contexts"]
+
+        # Construction dynamique de la grammaire EBNF pour ce sample précis
+        active_ids = [str(c["id"]) for c in chunks]
+        ids_rule = " | ".join([f'"{i}"' for i in active_ids])
+
+        dynamic_ebnf = f"""
+        id ::= {ids_rule}
+        citation_content ::= id (", " id)*
+        single_citation ::= "[" citation_content "]"
+
+        # 1. A single sentence ending with a period
+        sentence_base ::= [^\\.[\\.n]+ "."
+
+        # 2. A sentence unit: The base sentence + OPTIONAL citation immediately after
+        sentence_with_optional_cit ::= sentence_base (single_citation)?
+
+        # Root: A sequence of these individual sentence units
+        root ::= sentence_with_optional_cit (" " sentence_with_optional_cit)*
+        """
+
+        # Construction du User-Prompt avec injection des chunks et de la question
+        context_str = "\n".join([f"[{c['id']}] {c['text']}" for c in chunks])
+        user_prompt = f"""Reference Paragraphs:
+{context_str}

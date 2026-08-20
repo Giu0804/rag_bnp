@@ -1,0 +1,570 @@
+"""
+============================================================================
+PIPELINE DE DETECTION D'HALLUCINATION CLAIM-LEVEL POUR RAG
+============================================================================
+
+Hypothèse sur le format des données (df) :
+    - "question"       : str
+    - "generated_answer": str
+    - "atomic_claims"  : list[str] (ou str multi-lignes, normalisé automatiquement)
+    - "retrieved_chunks": list[dict], chaque dict = {"id": int/str, "text": str}
+
+Étapes :
+    1. Scoring claim-level : NLI (entail + contradict) + bge-reranker, batché GPU,
+       agrégés par MAX sur les chunks (on garde aussi le chunk gagnant pour audit/judge)
+    2. Labellisation via judge LLM (Qwen ou autre, passé en paramètre) -> dataset calibration
+    3. Entraînement + sauvegarde du meta-classifieur (LogReg) sur (nli_entail, nli_contradict, rerank_score)
+    4. Évaluation sur le test set (métriques + matrice de confusion)
+    5. Application en prod (sans judge) : verdict par claim + verdict global par réponse
+    6. Stockage/affichage des claims flagués comme hallucination
+
+generate_qwen n'est PAS défini ici : il est passé en paramètre (judge_fn) à build_calibration_dataset().
+============================================================================
+"""
+
+import pickle
+import json
+import numpy as np
+import pandas as pd
+import torch
+from tqdm import tqdm
+from typing import List, Dict, Tuple, Callable, Optional
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
+
+
+# =========================================================
+# 0. UTILS
+# =========================================================
+
+def parse_atomic_claims(atomic_claims) -> List[str]:
+    """Normalise atomic_claims en liste de strings, que ce soit déjà une liste ou du texte brut."""
+    if isinstance(atomic_claims, list):
+        return [str(c).strip() for c in atomic_claims if str(c).strip()]
+    if isinstance(atomic_claims, str):
+        return [f.strip("- *").strip() for f in atomic_claims.split("\n") if f.strip()]
+    return []
+
+
+# =========================================================
+# 1. SCORING CLAIM-LEVEL — NLI (vrai NLI, ex: mDeBERTa-xnli)
+# =========================================================
+
+def get_claim_level_nli_scores(
+    df: pd.DataFrame,
+    nli_model,
+    batch_size: int = 64,
+    claims_col: str = "atomic_claims",
+    chunks_col: str = "retrieved_chunks",
+) -> Dict[Tuple, Dict]:
+    """
+    Calcule, pour CHAQUE (row_idx, claim), le score NLI en testant TOUS les chunks
+    récupérés comme prémisse, et garde le MEILLEUR chunk (max entailment).
+
+    premise = chunk (text), hypothesis = claim -> c'est bien "le chunk implique-t-il le claim".
+
+    Retourne :
+        { (row_idx, claim): {
+              "entail": float,
+              "contradict": float,
+              "neutral": float,
+              "best_chunk_id": id du chunk qui a produit le meilleur score,
+              "best_chunk_text": texte de ce chunk,
+          }
+        }
+    """
+    all_pairs, all_claims, sample_indices, chunk_ids, chunk_texts = [], [], [], [], []
+
+    for idx, row in df.iterrows():
+        claims = parse_atomic_claims(row[claims_col])
+        chunks = row.get(chunks_col, []) if isinstance(row, dict) else row[chunks_col]
+        if not claims or not chunks:
+            continue
+        for claim in claims:
+            for chunk in chunks:
+                all_pairs.append({"text": chunk["text"], "text_pair": claim})
+                all_claims.append(claim)
+                sample_indices.append(idx)
+                chunk_ids.append(chunk["id"])
+                chunk_texts.append(chunk["text"])
+
+    if not all_pairs:
+        return {}
+
+    nli_best: Dict[Tuple, Dict] = {}
+
+    for i in tqdm(range(0, len(all_pairs), batch_size), desc="NLI claim-level inference"):
+        batch = all_pairs[i : i + batch_size]
+        results = nli_model(batch, top_k=None, batch_size=batch_size)
+
+        for j, pair_results in enumerate(results):
+            entail, contradict, neutral = 0.0, 0.0, 0.0
+            items = pair_results if isinstance(pair_results, list) else [pair_results]
+            for item in items:
+                lbl = str(item.get("label", "")).upper()
+                score = item.get("score", 0.0)
+                if "ENTAIL" in lbl:
+                    entail = score
+                elif "CONTRADICT" in lbl:
+                    contradict = score
+                elif "NEUTRAL" in lbl:
+                    neutral = score
+
+            global_idx = i + j
+            key = (sample_indices[global_idx], all_claims[global_idx])
+            prev = nli_best.get(key, {"entail": -1.0})
+
+            if entail > prev["entail"]:
+                nli_best[key] = {
+                    "entail": entail,
+                    "contradict": contradict,
+                    "neutral": neutral,
+                    "best_chunk_id": chunk_ids[global_idx],
+                    "best_chunk_text": chunk_texts[global_idx],
+                }
+
+    return nli_best
+
+
+# =========================================================
+# 2. SCORING CLAIM-LEVEL — bge-reranker (simulé en pseudo-NLI)
+# =========================================================
+
+def get_claim_level_reranker_scores(
+    df: pd.DataFrame,
+    reranker_model,
+    tokenizer,
+    batch_size: int = 128,
+    claims_col: str = "atomic_claims",
+    chunks_col: str = "retrieved_chunks",
+    device: str = "cuda",
+) -> Dict[Tuple, Dict]:
+    """
+    Calcule, pour CHAQUE (row_idx, claim), le score bge-reranker en testant TOUS les
+    chunks récupérés, et garde le MEILLEUR (max score).
+
+    Retourne :
+        { (row_idx, claim): {
+              "rerank_score": float,
+              "best_chunk_id": id du chunk gagnant,
+              "best_chunk_text": texte de ce chunk,
+          }
+        }
+    """
+    all_pairs, all_claims, sample_indices, chunk_ids, chunk_texts = [], [], [], [], []
+
+    for idx, row in df.iterrows():
+        claims = parse_atomic_claims(row[claims_col])
+        chunks = row.get(chunks_col, []) if isinstance(row, dict) else row[chunks_col]
+        if not claims or not chunks:
+            continue
+        for claim in claims:
+            for chunk in chunks:
+                all_pairs.append([claim, chunk["text"]])
+                all_claims.append(claim)
+                sample_indices.append(idx)
+                chunk_ids.append(chunk["id"])
+                chunk_texts.append(chunk["text"])
+
+    if not all_pairs:
+        return {}
+
+    rerank_best: Dict[Tuple, Dict] = {}
+
+    for i in tqdm(range(0, len(all_pairs), batch_size), desc="Reranker claim-level inference"):
+        batch_pairs = all_pairs[i : i + batch_size]
+        inputs = tokenizer(
+            batch_pairs, padding=True, truncation=True, return_tensors="pt", max_length=512
+        ).to(device)
+        with torch.no_grad():
+            logits = reranker_model(**inputs).logits.view(-1).float().cpu().numpy()
+
+        for j, score_val in enumerate(logits):
+            global_idx = i + j
+            key = (sample_indices[global_idx], all_claims[global_idx])
+            prev = rerank_best.get(key, {"rerank_score": -999.0})
+
+            if score_val > prev["rerank_score"]:
+                rerank_best[key] = {
+                    "rerank_score": float(np.round(score_val, 4)),
+                    "best_chunk_id": chunk_ids[global_idx],
+                    "best_chunk_text": chunk_texts[global_idx],
+                }
+
+    return rerank_best
+
+
+def build_feature_table(
+    nli_scores: Dict[Tuple, Dict],
+    rerank_scores: Dict[Tuple, Dict],
+) -> pd.DataFrame:
+    """
+    Fusionne NLI + reranker en une table de features par (row_idx, claim).
+    Le chunk de référence gardé pour l'audit/judge est celui du NLI (signal principal),
+    avec le score reranker de CE MEME chunk recalculé si besoin -- ici on garde simplement
+    le meilleur chunk reranker séparément à titre informatif (peuvent différer).
+    """
+    rows = []
+    for key, nli_s in nli_scores.items():
+        rerank_s = rerank_scores.get(key, {"rerank_score": 0.0, "best_chunk_id": None, "best_chunk_text": ""})
+        rows.append(
+            {
+                "row_idx": key[0],
+                "claim": key[1],
+                "nli_entail": nli_s["entail"],
+                "nli_contradict": nli_s["contradict"],
+                "nli_neutral": nli_s.get("neutral", 0.0),
+                "nli_best_chunk_id": nli_s["best_chunk_id"],
+                "nli_best_chunk_text": nli_s["best_chunk_text"],
+                "rerank_score": rerank_s["rerank_score"],
+                "rerank_best_chunk_id": rerank_s["best_chunk_id"],
+                "rerank_best_chunk_text": rerank_s["best_chunk_text"],
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+# =========================================================
+# 3. JUDGE LLM — system prompt + labellisation
+# =========================================================
+
+JUDGE_SYSTEM_PROMPT = """Tu es un vérificateur factuel rigoureux et impartial, spécialisé dans l'évaluation de systèmes RAG (Retrieval-Augmented Generation).
+
+TA TÂCHE :
+On te donne une AFFIRMATION (claim atomique extraite d'une réponse générée) et un CHUNK DE CONTEXTE (extrait d'un document source). Tu dois déterminer si le CHUNK, à lui seul, justifie factuellement l'AFFIRMATION.
+
+RÈGLES DE DÉCISION :
+1. SUPPORTED = le chunk contient l'information nécessaire pour affirmer le claim, explicitement ou par inférence directe et non ambiguë (pas de déduction hasardeuse).
+2. HALLUCINATED = l'une des situations suivantes s'applique :
+   - Le chunk ne mentionne pas l'information du claim (absence totale).
+   - Le chunk contredit le claim (contradiction factuelle).
+   - Le chunk mentionne un sujet proche mais pas l'information précise affirmée (ex: le chunk parle d'un autre médicament, une autre date, une autre valeur numérique).
+   - Le claim généralise ou extrapole au-delà de ce que dit réellement le chunk.
+3. En cas de doute raisonnable sur une inférence limite, privilégie HALLUCINATED (biais conservateur : mieux vaut sur-flaguer que sous-flaguer une hallucination potentielle).
+4. Ignore le style, la reformulation, la traduction : seul le contenu factuel compte.
+5. Ne te base JAMAIS sur tes connaissances générales du sujet -- seul le contenu du chunk fourni compte, même si tu sais que l'affirmation est vraie ou fausse par ailleurs.
+
+FORMAT DE SORTIE :
+Réponds STRICTEMENT par un seul mot, sans ponctuation, sans explication, sans préambule :
+SUPPORTED
+ou
+HALLUCINATED
+"""
+
+
+def build_judge_user_prompt(claim: str, chunk_text: str) -> str:
+    return f"""CHUNK DE CONTEXTE :
+{chunk_text}
+
+AFFIRMATION À VÉRIFIER :
+{claim}
+
+Verdict (un seul mot) :"""
+
+
+def build_calibration_dataset(
+    feature_table: pd.DataFrame,
+    judge_fn: Callable[[str, str], str],
+    chunk_text_col: str = "nli_best_chunk_text",
+    n_samples: Optional[int] = None,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """
+    Ajoute une colonne 'label' (1=SUPPORTED, 0=HALLUCINATED) en appelant judge_fn
+    sur chaque (claim, meilleur_chunk_selon_NLI).
+
+    judge_fn(system_prompt, user_prompt) -> str  (à brancher avec generate_qwen)
+    Le judge_fn passé doit gérer lui-même l'appel au modèle ; on lui fournit ici
+    le system prompt et le user prompt déjà construits.
+    """
+    table = feature_table.copy()
+    if n_samples is not None:
+        table = table.sample(n=min(n_samples, len(table)), random_state=random_state).reset_index(drop=True)
+
+    labels = []
+    raw_outputs = []
+    for _, row in tqdm(table.iterrows(), total=len(table), desc="Labellisation via judge LLM"):
+        user_prompt = build_judge_user_prompt(row["claim"], row[chunk_text_col])
+        raw_output = judge_fn(JUDGE_SYSTEM_PROMPT, user_prompt)
+        raw_outputs.append(raw_output)
+        label_clean = str(raw_output).strip().upper()
+        labels.append(1 if "SUPPORTED" in label_clean and "HALLUCINATED" not in label_clean else 0)
+
+    table["judge_raw_output"] = raw_outputs
+    table["label"] = labels
+    return table
+
+
+# =========================================================
+# 4. ENTRAINEMENT DU META-CLASSIFIEUR
+# =========================================================
+
+FEATURE_COLS = ["nli_entail", "nli_contradict", "nli_neutral", "rerank_score"]
+
+
+def train_meta_classifier(
+    calibration_df: pd.DataFrame,
+    feature_cols: List[str] = FEATURE_COLS,
+    cv_folds: int = 5,
+    save_path: str = "meta_classifier.pkl",
+) -> LogisticRegression:
+    """
+    Entraîne une régression logistique légère sur les features NLI + reranker,
+    labellisées par le judge. Sauvegarde les poids sur disque (pickle).
+    """
+    X = calibration_df[feature_cols].values
+    y = calibration_df["label"].values
+
+    print(f"Dataset d'entraînement : {len(X)} exemples "
+          f"({int(y.sum())} SUPPORTED / {int((1 - y).sum())} HALLUCINATED)")
+
+    clf = LogisticRegression(class_weight="balanced", max_iter=1000)
+
+    cv_scores = cross_val_score(clf, X, y, cv=cv_folds, scoring="f1")
+    print(f"Cross-val F1 ({cv_folds}-fold) : {cv_scores.mean():.2%} (+/- {cv_scores.std():.2%})")
+
+    clf.fit(X, y)  # fit final sur tout le train set
+
+    coefs = dict(zip(feature_cols, clf.coef_[0]))
+    print("Poids appris :", {k: round(v, 3) for k, v in coefs.items()})
+    print("Intercept :", round(clf.intercept_[0], 3))
+
+    with open(save_path, "wb") as f:
+        pickle.dump({"model": clf, "feature_cols": feature_cols}, f)
+    print(f"Classifieur sauvegardé -> {save_path}")
+
+    return clf
+
+
+def load_meta_classifier(path: str = "meta_classifier.pkl") -> Tuple[LogisticRegression, List[str]]:
+    with open(path, "rb") as f:
+        data = pickle.load(f)
+    return data["model"], data["feature_cols"]
+
+
+# =========================================================
+# 5. EVALUATION SUR LE TEST SET
+# =========================================================
+
+def evaluate_on_test_set(
+    test_df: pd.DataFrame,
+    clf: LogisticRegression,
+    feature_cols: List[str] = FEATURE_COLS,
+    save_report_path: Optional[str] = "test_evaluation_report.json",
+) -> Dict:
+    """
+    Évalue le classifieur sur le test set (labels = judge LLM sur le test set).
+    Affiche + sauvegarde : classification_report, matrice de confusion, F1.
+    """
+    X_test = test_df[feature_cols].values
+    y_test = test_df["label"].values
+    y_pred = clf.predict(X_test)
+
+    report_str = classification_report(
+        y_test, y_pred, target_names=["HALLUCINATED", "SUPPORTED"]
+    )
+    report_dict = classification_report(
+        y_test, y_pred, target_names=["HALLUCINATED", "SUPPORTED"], output_dict=True
+    )
+    cm = confusion_matrix(y_test, y_pred)
+
+    print("=== Évaluation sur le test set ===")
+    print(report_str)
+    print("Matrice de confusion (lignes=vrai, colonnes=prédit) :")
+    print("                 HALLUCINATED  SUPPORTED")
+    print(f"HALLUCINATED     {cm[0][0]:>12} {cm[0][1]:>10}")
+    print(f"SUPPORTED        {cm[1][0]:>12} {cm[1][1]:>10}")
+
+    result = {"classification_report": report_dict, "confusion_matrix": cm.tolist()}
+
+    if save_report_path:
+        with open(save_report_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+        print(f"Rapport sauvegardé -> {save_report_path}")
+
+    return result
+
+
+# =========================================================
+# 6. DECISION EN PROD (claim -> réponse) + stockage hallucinations
+# =========================================================
+
+def check_claim_grounded(
+    nli_entail: float,
+    nli_contradict: float,
+    nli_neutral: float,
+    rerank_score: float,
+    clf: LogisticRegression,
+    feature_cols: List[str] = FEATURE_COLS,
+) -> bool:
+    """True = grounded (supporté), False = hallucination probable. Pas d'appel LLM ici."""
+    feat_map = {
+        "nli_entail": nli_entail,
+        "nli_contradict": nli_contradict,
+        "nli_neutral": nli_neutral,
+        "rerank_score": rerank_score,
+    }
+    x = np.array([[feat_map[c] for c in feature_cols]])
+    return bool(clf.predict(x)[0])
+
+
+def check_response(
+    row_idx,
+    question: str,
+    claims: List[str],
+    feature_table: pd.DataFrame,
+    clf: LogisticRegression,
+    feature_cols: List[str] = FEATURE_COLS,
+    abstain_ratio: float = 0.3,
+) -> Dict:
+    """
+    Verdict global d'une réponse à partir des verdicts par claim.
+    Retourne aussi la liste détaillée des claims flagués hallucination (pour stockage/audit).
+    """
+    sub = feature_table[(feature_table["row_idx"] == row_idx) & (feature_table["claim"].isin(claims))]
+
+    claim_results = {}
+    hallucinated_claims = []
+
+    for _, r in sub.iterrows():
+        grounded = check_claim_grounded(
+            nli_entail=r["nli_entail"],
+            nli_contradict=r["nli_contradict"],
+            nli_neutral=r["nli_neutral"],
+            rerank_score=r["rerank_score"],
+            clf=clf,
+            feature_cols=feature_cols,
+        )
+        claim_results[r["claim"]] = grounded
+        if not grounded:
+            hallucinated_claims.append(
+                {
+                    "claim": r["claim"],
+                    "nli_entail": r["nli_entail"],
+                    "nli_contradict": r["nli_contradict"],
+                    "rerank_score": r["rerank_score"],
+                    "closest_chunk_id": r["nli_best_chunk_id"],
+                    "closest_chunk_text": r["nli_best_chunk_text"],
+                }
+            )
+
+    if not claim_results:
+        return {"row_idx": row_idx, "question": question, "verdict": "NO_CLAIMS",
+                "claim_results": {}, "hallucinated_claims": []}
+
+    n_hallucinated = len(hallucinated_claims)
+    ratio = n_hallucinated / len(claim_results)
+
+    if n_hallucinated == 0:
+        verdict = "GROUNDED"
+    elif ratio > abstain_ratio:
+        verdict = "ABSTAIN"
+    else:
+        verdict = "PARTIAL"
+
+    return {
+        "row_idx": row_idx,
+        "question": question,
+        "verdict": verdict,
+        "hallucination_ratio": ratio,
+        "claim_results": claim_results,
+        "hallucinated_claims": hallucinated_claims,
+    }
+
+
+def run_full_evaluation_and_store(
+    df: pd.DataFrame,
+    feature_table: pd.DataFrame,
+    clf: LogisticRegression,
+    feature_cols: List[str] = FEATURE_COLS,
+    abstain_ratio: float = 0.3,
+    claims_col: str = "atomic_claims",
+    output_path: str = "hallucination_report.json",
+) -> pd.DataFrame:
+    """
+    Applique check_response sur tout un dataframe, affiche un résumé, et stocke :
+      - un JSON détaillé (par réponse : verdict + claims hallucinés)
+      - un DataFrame résumé (1 ligne par réponse)
+    """
+    all_results = []
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Vérification des réponses"):
+        claims = parse_atomic_claims(row[claims_col])
+        result = check_response(
+            row_idx=idx,
+            question=row.get("question", ""),
+            claims=claims,
+            feature_table=feature_table,
+            clf=clf,
+            feature_cols=feature_cols,
+            abstain_ratio=abstain_ratio,
+        )
+        all_results.append(result)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(all_results, f, indent=2, ensure_ascii=False)
+
+    verdict_counts = pd.Series([r["verdict"] for r in all_results]).value_counts()
+    print("=== Résumé des verdicts ===")
+    print(verdict_counts)
+    print(f"Rapport détaillé sauvegardé -> {output_path}")
+
+    total_hallucinated_claims = sum(len(r["hallucinated_claims"]) for r in all_results)
+    print(f"Total de claims flagués comme hallucination : {total_hallucinated_claims}")
+
+    summary_rows = [
+        {
+            "row_idx": r["row_idx"],
+            "question": r["question"],
+            "verdict": r["verdict"],
+            "n_claims": len(r["claim_results"]),
+            "n_hallucinated": len(r["hallucinated_claims"]),
+        }
+        for r in all_results
+    ]
+    return pd.DataFrame(summary_rows)
+
+
+# =========================================================
+# 7. EXEMPLE D'UTILISATION END-TO-END
+# =========================================================
+
+if __name__ == "__main__":
+    # --- Chargement modèles (à adapter) ---
+    # from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+    # nli_model = pipeline("text-classification", model="MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7", device=0)
+    # reranker_tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-reranker-v2-m3")
+    # reranker_model = AutoModelForSequenceClassification.from_pretrained("BAAI/bge-reranker-v2-m3").to("cuda").eval()
+
+    # --- Chargement des données ---
+    # train_df = pd.read_parquet("train_200.parquet")   # colonnes: question, generated_answer, atomic_claims, retrieved_chunks
+    # test_df  = pd.read_parquet("test_100.parquet")
+
+    # --- 1. Scoring claim-level (train + test) ---
+    # nli_scores_train = get_claim_level_nli_scores(train_df, nli_model)
+    # rerank_scores_train = get_claim_level_reranker_scores(train_df, reranker_model, reranker_tokenizer)
+    # feature_table_train = build_feature_table(nli_scores_train, rerank_scores_train)
+
+    # nli_scores_test = get_claim_level_nli_scores(test_df, nli_model)
+    # rerank_scores_test = get_claim_level_reranker_scores(test_df, reranker_model, reranker_tokenizer)
+    # feature_table_test = build_feature_table(nli_scores_test, rerank_scores_test)
+
+    # --- 2. Judge LLM : judge_fn(system_prompt, user_prompt) -> "SUPPORTED"/"HALLUCINATED" ---
+    # def judge_fn(system_prompt, user_prompt):
+    #     return generate_qwen(system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=5)
+    #
+    # calibration_train = build_calibration_dataset(feature_table_train, judge_fn)
+    # calibration_test  = build_calibration_dataset(feature_table_test, judge_fn)
+
+    # --- 3. Entraînement + sauvegarde ---
+    # clf = train_meta_classifier(calibration_train, save_path="meta_classifier.pkl")
+
+    # --- 4. Évaluation test set ---
+    # evaluate_on_test_set(calibration_test, clf)
+
+    # --- 5. Application en prod sur le test set (sans re-appeler le judge) + stockage hallucinations ---
+    # clf, feature_cols = load_meta_classifier("meta_classifier.pkl")
+    # summary_df = run_full_evaluation_and_store(test_df, feature_table_test, clf, feature_cols)
+    # print(summary_df.head())
+
+    pass
