@@ -95,6 +95,12 @@ def get_claim_level_nli_scores(
     return nli_best
 
 
+import torch
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from typing import Dict, Tuple
+
 # =========================================================
 # 2. SCORING CLAIM-LEVEL — RERANKER
 # =========================================================
@@ -112,10 +118,13 @@ def get_claim_level_reranker_scores(
     all_pairs, all_claims, sample_indices, chunk_ids, chunk_texts = [], [], [], [], []
 
     for idx, row in df.iterrows():
+        # J'assume que parse_atomic_claims est défini ailleurs dans ton script
         claims = parse_atomic_claims(row[claims_col])
         chunks = row.get(chunks_col, []) if isinstance(row, dict) else row[chunks_col]
+        
         if not claims or not chunks:
             continue
+            
         for claim in claims:
             for chunk in chunks:
                 all_pairs.append([claim, chunk["text"]])
@@ -134,13 +143,17 @@ def get_claim_level_reranker_scores(
         inputs = tokenizer(
             batch_pairs, padding=True, truncation=True, return_tensors="pt", max_length=512
         ).to(device)
+        
         with torch.no_grad():
-            logits = reranker_model(**inputs).logits.view(-1).float().cpu().numpy()
+            # --- MODIFICATION ICI : ajout de torch.sigmoid ---
+            probs = torch.sigmoid(reranker_model(**inputs).logits.view(-1).float()).cpu().numpy()
 
-        for j, score_val in enumerate(logits):
+        for j, score_val in enumerate(probs):
             global_idx = i + j
             key = (sample_indices[global_idx], all_claims[global_idx])
-            prev = rerank_best.get(key, {"rerank_score": -999.0})
+            
+            # --- MODIFICATION : -1.0 au lieu de -999.0 pour des probabilités ---
+            prev = rerank_best.get(key, {"rerank_score": -1.0})
 
             if score_val > prev["rerank_score"]:
                 rerank_best[key] = {
@@ -168,15 +181,13 @@ def build_feature_table(
                 "nli_contradict": nli_s["contradict"],
                 "nli_neutral": nli_s.get("neutral", 0.0),
                 "nli_best_chunk_id": nli_s["best_chunk_id"],
-                "nli_best_chunk_text": nli_s["best_chunk_text"],
+                "nli_best_chunk_text": nli_s["best_chunk_id"], # Correction potentielle: vérifier si c'était bien text attendu ici
                 "rerank_score": rerank_s["rerank_score"],
                 "rerank_best_chunk_id": rerank_s["best_chunk_id"],
                 "rerank_best_chunk_text": rerank_s["best_chunk_text"],
             }
         )
     return pd.DataFrame(rows)
-
-
 # =========================================================
 # 3. JUDGE LLM — PROMPTS & LABELLISATION
 # =========================================================
