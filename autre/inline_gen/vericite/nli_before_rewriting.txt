@@ -1,0 +1,96 @@
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+def validate_claims_with_reranker(df, model, tokenizer, score_threshold=0.5, batch_size=128):
+    """
+    Simule une étape NLI avec un Reranker pour valider chaque atomic_claim d'une réponse.
+    """
+    all_pairs = []
+    mapping = [] # Stocke : (index_ligne, index_claim, texte_claim, id_chunk)
+
+    # =========================================================
+    # ÉTAPE 1 : Aplatissement (Flattening)
+    # On crée toutes les paires possibles (Claim, Chunk)
+    # =========================================================
+    for row_idx, row in df.iterrows():
+        # Je pars du principe que row['atomic_claims'] est une liste de strings.
+        # Si c'est un string brut (ex: JSON), utilise ta fonction parse_atomic_claims() ici.
+        claims = row['atomic_claims'] 
+        chunks = row['contexts']
+        
+        if not isinstance(claims, list) or not isinstance(chunks, list) or len(claims) == 0:
+            continue
+            
+        for claim_idx, claim_text in enumerate(claims):
+            for chunk in chunks:
+                # Text A: Claim (Requête) / Text B: Chunk (Document)
+                all_pairs.append([claim_text, chunk['text']])
+                mapping.append((row_idx, claim_idx, claim_text, chunk['id']))
+                
+    if not all_pairs:
+        return df
+
+    # =========================================================
+    # ÉTAPE 2 : Inférence GPU massive en batchs
+    # =========================================================
+    all_probs = []
+    model.eval()
+    
+    # Assure-toi que le modèle est sur le bon device
+    device = next(model.parameters()).device 
+
+    for i in tqdm(range(0, len(all_pairs), batch_size), desc="Validation des Claims (NLI)"):
+        batch = all_pairs[i : i + batch_size]
+        inputs = tokenizer(batch, padding=True, truncation=True, return_tensors='pt', max_length=512).to(device)
+        
+        with torch.no_grad():
+            outputs = model(**inputs)
+            # Transformation des Logits bruts en Probabilités via Sigmoïde
+            probs = torch.sigmoid(outputs.logits.view(-1).float()).cpu().numpy()
+            all_probs.extend(probs)
+            
+    # =========================================================
+    # ÉTAPE 3 : Reconstruction du "Diagnostic par Affirmation"
+    # =========================================================
+    # On initialise un dictionnaire pour stocker l'état de chaque claim
+    row_diagnostics = {idx: {} for idx in df.index}
+    
+    for (row_idx, claim_idx, claim_text, chunk_id), prob in zip(mapping, all_probs):
+        # Initialisation du claim s'il n'existe pas encore dans notre dictionnaire
+        if claim_idx not in row_diagnostics[row_idx]:
+            row_diagnostics[row_idx][claim_idx] = {
+                "claim_text": claim_text,
+                "is_supported": False, # Passera à True si au moins un chunk valide ce claim
+                "supporting_chunks": [], # Liste des IDs des chunks qui valident le claim
+                "max_score": 0.0 # Juste pour garder une trace de la meilleure correspondance
+            }
+            
+        # Mise à jour du score max
+        if prob > row_diagnostics[row_idx][claim_idx]["max_score"]:
+            row_diagnostics[row_idx][claim_idx]["max_score"] = float(np.round(prob, 4))
+            
+        # Si la probabilité dépasse le seuil, ce chunk est une PREUVE valide
+        if prob >= score_threshold:
+            row_diagnostics[row_idx][claim_idx]["is_supported"] = True
+            row_diagnostics[row_idx][claim_idx]["supporting_chunks"].append(chunk_id)
+            
+    # =========================================================
+    # ÉTAPE 4 : Intégration dans le DataFrame final
+    # =========================================================
+    final_results = []
+    for row_idx, row in df.iterrows():
+        # On transforme le dictionnaire de claims en une liste propre pour cette ligne
+        claims_diagnostic = list(row_diagnostics.get(row_idx, {}).values())
+        
+        final_results.append({
+            "question": row["question"],
+            "contexts": row["contexts"],
+            "generated_answer": row["generated_answer"],
+            "GT_cited": row.get("GT_cited", []),
+            "claims_diagnostic": claims_diagnostic # <-- C'est NOTRE payload pour le LLM !
+        })
+        
+    return pd.DataFrame(final_results) 
+
+c bien ca ? juste questce que ca nous retourne, reste concis quand tu t exprimes, j ai tjrs du mal à saisir commrnt les citations sont mises inline
