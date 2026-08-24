@@ -93,4 +93,126 @@ def validate_claims_with_reranker(df, model, tokenizer, score_threshold=0.5, bat
         
     return pd.DataFrame(final_results) 
 
-c bien ca ? juste questce que ca nous retourne, reste concis quand tu t exprimes, j ai tjrs du mal à saisir commrnt les citations sont mises inline
+
+
+
+
+
+
+
+ABSTENTION_PATTERNS = [
+    # Français
+    "ne mentionne pas", "ne précise pas", "non fourni", 
+    "aucune information", "inconnu", "non indiqué",
+    "pas d'information", "impossible de déterminer",
+    "non spécifié", "pas mentionné", "introuvable",
+    "information non suffisante", "informations non suffisantes",
+    "pas assez d'information", "données insuffisantes",
+    
+    # Anglais
+    "does not mention", "not mentioned", "not specified",
+    "no information", "unknown", "not provided",
+    "not stated", "cannot determine", "unable to determine",
+    "not given", "not found", "no data",
+    "insufficient information", "not enough information",
+    "insufficient data"
+]
+
+def is_abstention(claim_text: str) -> bool:
+    text = claim_text.lower()
+    return any(p in text for p in ABSTENTION_PATTERNS)
+
+
+
+
+
+
+
+
+
+def validate_claims_with_reranker_abstention(df, model, tokenizer, score_threshold=0.7, batch_size=128):
+    """
+    Évalue chaque atomic claim face aux chunks.
+    Gère la conversion logits -> sigmoïde et exempte les abstentions.
+    """
+    all_pairs = []
+    mapping = []  # (row_idx, claim_idx, claim_text, chunk_id)
+
+    # 1. Préparation des paires (Claim, Chunk)
+    for row_idx, row in df.iterrows():
+        # Utiliser parse_atomic_claims(row['atomic_claims']) si c'est une string
+        claims = row.get('atomic_claims', [])
+        chunks = row.get('contexts', [])
+        
+        if not isinstance(claims, list) or not isinstance(chunks, list) or len(claims) == 0:
+            continue
+            
+        for claim_idx, claim_text in enumerate(claims):
+            # Si le claim est une abstention, pas besoin de le comparer aux chunks
+            if is_abstention(claim_text):
+                continue
+                
+            for chunk in chunks:
+                all_pairs.append([claim_text, chunk['text']])
+                mapping.append((row_idx, claim_idx, claim_text, chunk['id']))
+
+    # 2. Inférence GPU massive par batchs
+    all_probs = []
+    if all_pairs:
+        model.eval()
+        device = next(model.parameters()).device 
+
+        for i in tqdm(range(0, len(all_pairs), batch_size), desc="Validation NLI (Reranker)"):
+            batch = all_pairs[i : i + batch_size]
+            inputs = tokenizer(batch, padding=True, truncation=True, return_tensors='pt', max_length=512).to(device)
+            
+            with torch.no_grad():
+                outputs = model(**inputs)
+                probs = torch.sigmoid(outputs.logits.view(-1).float()).cpu().numpy()
+                all_probs.extend(probs)
+
+    # 3. Structuration du diagnostic par claim
+    row_diagnostics = {idx: {} for idx in df.index}
+    
+    # 3a. Initialisation complète de tous les claims (y compris abstentions)
+    for row_idx, row in df.iterrows():
+        claims = row.get('atomic_claims', [])
+        if not isinstance(claims, list):
+            continue
+            
+        for claim_idx, claim_text in enumerate(claims):
+            abstention_flag = is_abstention(claim_text)
+            row_diagnostics[row_idx][claim_idx] = {
+                "claim_text": claim_text,
+                "is_abstention": abstention_flag,
+                "is_supported": True if abstention_flag else False,
+                "supporting_chunks": [],
+                "max_score": 0.0
+            }
+
+    # 3b. Affectation des scores du reranker pour les claims non-abstention
+    for (row_idx, claim_idx, claim_text, chunk_id), prob in zip(mapping, all_probs):
+        diag = row_diagnostics[row_idx][claim_idx]
+        
+        if prob > diag["max_score"]:
+            diag["max_score"] = float(np.round(prob, 4))
+            
+        if prob >= score_threshold:
+            diag["is_supported"] = True
+            diag["supporting_chunks"].append(chunk_id)
+
+    # 4. Construction du DataFrame de sortie
+    final_results = []
+    for row_idx, row in df.iterrows():
+        claims_diagnostic = list(row_diagnostics.get(row_idx, {}).values())
+        
+        final_results.append({
+            "question": row["question"],
+            "contexts": row["contexts"],
+            "generated_answer": row["generated_answer"],
+            "atomic_claims": row.get("atomic_claims", []),
+            "GT_cited": row.get("GT_cited", []),
+            "claims_diagnostic": claims_diagnostic
+        })
+        
+    return pd.DataFrame(final_results)
