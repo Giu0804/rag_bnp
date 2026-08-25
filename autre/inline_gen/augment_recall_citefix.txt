@@ -1,0 +1,279 @@
+import re
+import nltk
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+from nltk.corpus import stopwords
+
+# ==========================================================
+# 1. INITIALISATION DES STOPWORDS BILINGUES (FR / EN)
+# ==========================================================
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
+
+FRENCH_STOPS = set(stopwords.words('french'))
+ENGLISH_STOPS = set(stopwords.words('english'))
+BILINGUAL_STOPWORDS = FRENCH_STOPS.union(ENGLISH_STOPS)
+
+def clean_text_words(text):
+    """Découpe en mots minuscules et retire les stopwords FR et EN."""
+    words = re.findall(r"\b\w+\b", str(text).lower())
+    return set(w for w in words if w not in BILINGUAL_STOPWORDS)
+
+
+# ==========================================================
+# 2. SCORING ADAPTÉ CITEFIX (OPTION A : ASYMÉTRIQUE)
+# ==========================================================
+def compute_lexical_score_asymmetric(snip_tokens, doc_tokens):
+    """Calcule la proportion des mots du snippet présents dans le document."""
+    if not snip_tokens:
+        return 0.0
+    return len(snip_tokens.intersection(doc_tokens)) / len(snip_tokens)
+
+
+def compute_scores_for_sample(row, lambda_val):
+    """
+    Calcule le score hybride S(x_i, doc_j) = lambda * f_lex + (1 - lambda) * r(q, doc_j)
+    pour chaque snippet et chaque document du contexte.
+    """
+    contexts = row["contexts"]  # [{'id': 0, 'text': '...', 'score': 0.85}, ...]
+    inline_processed = row["inline_processed"]
+
+    # Prétraitement et mise en cache des documents du contexte
+    doc_token_cache = {}
+    doc_retrieval_scores = {}
+    for ctx in contexts:
+        d_id = int(ctx["id"])
+        doc_token_cache[d_id] = clean_text_words(ctx["text"])
+        # Score de pertinence Qwen Reranker (normalisé entre 0 et 1)
+        doc_retrieval_scores[d_id] = float(ctx.get("score", ctx.get("rerank_score", 0.0)))
+
+    snippet_scores = {}  # {snippet_id: {doc_id: score}}
+    for item in inline_processed:
+        sid = item["snippet_id"]
+        snip_tokens = clean_text_words(item["text"])
+
+        snippet_scores[sid] = {}
+        for d_id, doc_tokens in doc_token_cache.items():
+            f_lex = compute_lexical_score_asymmetric(snip_tokens, doc_tokens)
+            r_score = doc_retrieval_scores[d_id]
+            # Équation hybride adaptée de CiteFix
+            s_ij = (lambda_val * f_lex) + ((1.0 - lambda_val) * r_score)
+            snippet_scores[sid][d_id] = s_ij
+
+    return snippet_scores
+
+
+# ==========================================================
+# 3. ENRICHISSEMENT ADAPTATIF BASÉ SUR LE SCORE MOYEN
+# ==========================================================
+def apply_adaptive_validation(row, snippet_scores, gamma=0.85, fallback_tau=0.30):
+    """
+    Valide et ajoute un document si son score >= gamma * moyenne(scores des citations initiales).
+    """
+    enriched_snippets = []
+    for item in row["inline_processed"]:
+        sid = item["snippet_id"]
+        # Récupère les citations actuelles (compatible numpy array, list ou set)
+        raw_cits = item.get("citations", item.get("citation", []))
+        if isinstance(raw_cits, np.ndarray):
+            base_cits = set(raw_cits.tolist())
+        else:
+            base_cits = set(raw_cits)
+
+        scores_for_snip = snippet_scores.get(sid, {})
+
+        # Calcul du seuil adaptatif basé sur la moyenne
+        if len(base_cits) > 0:
+            initial_scores = [scores_for_snip.get(int(c), 0.0) for c in base_cits]
+            adaptive_tau = gamma * float(np.mean(initial_scores))
+        else:
+            adaptive_tau = fallback_tau
+
+        # Enrichissement du set de citations
+        new_cits = set(base_cits)
+        for d_id, score in scores_for_snip.items():
+            if score >= adaptive_tau:
+                new_cits.add(d_id)
+
+        enriched_snippets.append({
+            "snippet_id": sid,
+            "text": item["text"],
+            "citations": np.array(sorted(list(new_cits)), dtype=int)
+        })
+
+    return enriched_snippets
+
+
+# ==========================================================
+# 4. ÉVALUATION AU NIVEAU DU SNIPPET (ÉCHELLE MICRO)
+# ==========================================================
+def evaluate_micro_level(df, eval_column="inline_processed_eval"):
+    """
+    Évalue les performances citation par citation sur tous les snippets indépendamment.
+    """
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
+    total_exact_match = 0
+    total_snippets = 0
+
+    for _, row in df.iterrows():
+        # Construction du dictionnaire GT {snippet_id: set(citations)}
+        gt_raw = row["gt_citations"]
+        if isinstance(gt_raw, dict):
+            gt_dict = {int(k): set(v) for k, v in gt_raw.items()}
+        else:
+            gt_dict = {
+                item["snippet_id"]: set(item["citations"].tolist() if isinstance(item["citations"], np.ndarray) else item["citations"])
+                for item in gt_raw
+            }
+
+        pred_list = row[eval_column]
+
+        for item in pred_list:
+            sid = item["snippet_id"]
+            preds = item["citations"]
+            pred_set = set(preds.tolist() if isinstance(preds, np.ndarray) else preds)
+            gt_set = set(gt_dict.get(sid, []))
+
+            tp = len(pred_set.intersection(gt_set))
+            fp = len(pred_set - gt_set)
+            fn = len(gt_set - pred_set)
+
+            total_tp += tp
+            total_fp += fp
+            total_fn += fn
+            total_snippets += 1
+
+            if pred_set == gt_set:
+                total_exact_match += 1
+
+    precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+    recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    exact_match = total_exact_match / total_snippets if total_snippets > 0 else 0.0
+
+    return {
+        "micro_recall": recall,
+        "micro_precision": precision,
+        "micro_f1": f1,
+        "exact_match": exact_match,
+        "tp": total_tp,
+        "fp": total_fp,
+        "fn": total_fn,
+        "total_snippets": total_snippets
+    }
+
+
+# ==========================================================
+# 5. GRID SEARCH SUR LAMBDA [0.1 À 0.9] & TRACÉ DE COURBE
+# ==========================================================
+def run_lambda_grid_search(df, lambda_start=0.1, lambda_end=0.9, step=0.05, gamma=0.85):
+    """
+    Exécute le Grid Search, affiche les résultats numériques et trace la courbe finale.
+    """
+    lambdas = np.arange(lambda_start, lambda_end + 1e-5, step)
+    results = []
+
+    print(f"\n{'='*95}")
+    print(f"{'GRID SEARCH CITEFIX (ÉCHELLE SNIPPET)':^95}")
+    print(f"{'='*95}")
+    print(f"{'Lambda':<8} | {'Rappel':<9} | {'Précision':<11} | {'F1-Score':<10} | {'ExactMatch':<12} | {'TP':<6} | {'FP':<6} | {'FN':<6}")
+    print(f"{'-'*95}")
+
+    for l_val in lambdas:
+        l_val = round(l_val, 3)
+        temp_enriched_col = []
+
+        for _, row in df.iterrows():
+            scores = compute_scores_for_sample(row, lambda_val=l_val)
+            enriched = apply_adaptive_validation(row, scores, gamma=gamma)
+            temp_enriched_col.append(enriched)
+
+        df_temp = df.copy()
+        df_temp["inline_processed_eval"] = temp_enriched_col
+
+        metrics = evaluate_micro_level(df_temp, eval_column="inline_processed_eval")
+        metrics["lambda"] = l_val
+        results.append(metrics)
+
+        print(f"{l_val:<8.2f} | {metrics['micro_recall']*100:<8.2f}% | {metrics['micro_precision']*100:<10.2f}% | "
+              f"{metrics['micro_f1']*100:<9.2f}% | {metrics['exact_match']*100:<11.2f}% | "
+              f"{metrics['tp']:<6} | {metrics['fp']:<6} | {metrics['fn']:<6}")
+
+    print(f"{'='*95}\n")
+    res_df = pd.DataFrame(results)
+
+    # Tracé de la courbe
+    plt.figure(figsize=(10, 6))
+    plt.plot(res_df["lambda"], res_df["micro_recall"] * 100, marker='o', label="Rappel (Micro)", color="#2ca02c", linewidth=2.5)
+    plt.plot(res_df["lambda"], res_df["micro_precision"] * 100, marker='s', label="Précision (Micro)", color="#1f77b4", linewidth=2)
+    plt.plot(res_df["lambda"], res_df["micro_f1"] * 100, marker='^', label="F1-Score (Micro)", color="#ff7f0e", linestyle="--")
+    plt.plot(res_df["lambda"], res_df["exact_match"] * 100, marker='d', label="Exact Match", color="#9467bd", linestyle=":")
+
+    plt.title("Évolution des Métriques par Snippet selon $\lambda$ (Poids Lexical vs Qwen Reranker)", fontsize=13, pad=12)
+    plt.xlabel("Valeur de $\lambda$ ($0.0 = $ Reranker pur, $1.0 = $ Lexical pur)", fontsize=11)
+    plt.ylabel("Score (%)", fontsize=11)
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.legend(fontsize=11)
+    plt.tight_layout()
+    plt.show()
+
+    return res_df
+
+
+# ==========================================================
+# 6. FONCTION HEATMAP POUR UNE VALEUR DÉFINIE DE LAMBDA
+# ==========================================================
+def plot_heatmap_for_lambda(df, target_lambda, gamma=0.85):
+    """
+    Calcule et trace la matrice de confusion (TP, FP, FN) sous forme de heatmap
+    pour une valeur précise de lambda.
+    """
+    temp_col = []
+    for _, row in df.iterrows():
+        scores = compute_scores_for_sample(row, lambda_val=target_lambda)
+        enriched = apply_adaptive_validation(row, scores, gamma=gamma)
+        temp_col.append(enriched)
+
+    df_temp = df.copy()
+    df_temp["eval_heatmap"] = temp_col
+    m = evaluate_micro_level(df_temp, eval_column="eval_heatmap")
+
+    tp = m["tp"]
+    fp = m["fp"]
+    fn = m["fn"]
+
+    matrix_data = np.array([
+        [tp, fn],
+        [fp, 0]
+    ])
+
+    labels = np.array([
+        [f"Vrais Positifs (TP)\n{tp}\n(Citations correctes)", f"Faux Négatifs (FN)\n{fn}\n(Citations oubliées)"],
+        [f"Faux Positifs (FP)\n{fp}\n(Sur-citations)", "Vrais Négatifs (TN)\n-\n(Hors contexte)"]
+    ])
+
+    plt.figure(figsize=(7.5, 5.5))
+    sns.heatmap(
+        matrix_data,
+        annot=labels,
+        fmt="",
+        cmap="Blues",
+        cbar=True,
+        xticklabels=["Prédit Cité", "Prédit Non-Cité"],
+        yticklabels=["Attendu (GT)", "Non-Attendu"]
+    )
+
+    plt.title(f"Matrice de Confusion des Citations au Snippet ($\lambda = {target_lambda}$)\n"
+              f"Rappel : {m['micro_recall']*100:.2f}% | Précision : {m['micro_precision']*100:.2f}% | F1 : {m['micro_f1']*100:.2f}%",
+              fontsize=12, pad=12)
+    plt.ylabel("Vérité Terrain (GT)", fontsize=11)
+    plt.xlabel("Prédiction Post-Hoc", fontsize=11)
+    plt.tight_layout()
+    plt.show()

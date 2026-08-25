@@ -133,46 +133,44 @@ def compute_attention_per_snippet(prompt_text, inline_processed, doc_spans):
 # TRAITEMENT DU DATAFRAME ET CRÉATION DE LA NOUVELLE COLONNE
 # ==========================================================
 def process_dataset(df):
-    new_inline_processed_list = []
+    new_inline_processed_list = []
 
-    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Extraction Attention"):
-        prompt_text = f"Contexts:\n{row['contexts']}\nQuestion: {row['question']}\nAnswer:"
-        inline_processed = row["inline_processed"]
-        
-        # Récupération des positions des documents
-        doc_spans = extract_doc_char_spans(prompt_text)
-        
-        # Extraction des attentions
-        attn_scores = compute_attention_per_snippet(prompt_text, inline_processed, doc_spans)
-        
-        # Construction de la nouvelle structure enrichie
-        sample_enriched_inline = []
-        for item in inline_processed:
-            sid = item["snippet_id"]
-            # Citations de base issues de la génération
-            current_cits = set(item.get("citation", []))
-            
-            # Post-hoc : ajout si l'attention interne dépasse le seuil tau
-            snip_scores = attn_scores.get(sid, {})
-            for d_id, score in snip_scores.items():
-                if score > ATTENTION_THRESHOLD:
-                    current_cits.add(d_id)
-            
-            sample_enriched_inline.append({
-                "snippet_id": sid,
-                "text": item["text"],
-                "citation": sorted(list(current_cits))
-            })
-            
-        new_inline_processed_list.append(sample_enriched_inline)
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Extraction Attention"):
+        # 1. On récupère les éléments de la ligne actuelle
+        contexts_list = row["contexts"]        # Le tableau [{'id': 0, 'text': '...'}, ...]
+        question = row["question"]              # La question posée
+        inline_processed = row["inline_processed"] # La liste de snippets générée par vLLM
 
-    # Création directe de la nouvelle colonne
-    df["inline_processed_attention"] = new_inline_processed_list
-    return df
+        # 2. On assemble le prompt ET on relève les positions exactes de chaque doc
+        prompt_text, doc_spans = build_prompt_and_get_doc_spans(contexts_list, question)
 
-# Exécution :
-# df = process_dataset(df)
-# df.to_json("df_with_attention_citations.json", orient="records")
+        # 3. On extrait les scores d'attention pour chaque snippet via le forward pass
+        attn_scores = compute_attention_per_snippet(prompt_text, inline_processed, doc_spans)
 
+        # 4. On enrichit les citations de chaque snippet avec le seuil tau
+        sample_enriched_inline = []
+        for item in inline_processed:
+            sid = item["snippet_id"]
+            snip_text = item["text"]
+            
+            # Citations de base issues de vLLM (ex: [1])
+            current_cits = set(item.get("citation", []))
 
-sur tout ce code avec ce qu on vient de dire c quoi qui dit ête modifié
+            # Post-hoc : si l'attention interne sur un document dépasse le seuil, on l'ajoute
+            snip_scores = attn_scores.get(sid, {})
+            for doc_id, score in snip_scores.items():
+                if score > ATTENTION_THRESHOLD:
+                    current_cits.add(doc_id)
+
+            # On recrée l'objet snippet identique avec les citations mises à jour
+            sample_enriched_inline.append({
+                "snippet_id": sid,
+                "text": snip_text,
+                "citation": sorted(list(current_cits))
+            })
+
+        new_inline_processed_list.append(sample_enriched_inline)
+
+    # 5. On assigne la nouvelle colonne au DataFrame
+    df["inline_processed_attention"] = new_inline_processed_list
+    return df
