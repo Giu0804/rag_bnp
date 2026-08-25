@@ -620,3 +620,14 @@ def plot_heatmap_for_lambda(df, target_lambda, gt_col='preannotation', gamma=0.8
     plt.xlabel("Prédiction Post-Hoc", fontsize=11)
     plt.tight_layout()
     plt.show()
+
+
+
+
+
+
+# 1. Grid search de 0.1 à 0.9 par pas de 0.05
+res_df = run_lambda_grid_search(df, gt_col='preannotation', lambda_start=0.1, lambda_end=0.9, step=0.05, gamma=0.85)
+
+# 2. Heatmap sur une valeur choisie (ex: lambda = 0.75)
+plot_heatmap_for_lambda(df, target_lambda=0.75, gt_col='preannotation', gamma=0.85)
