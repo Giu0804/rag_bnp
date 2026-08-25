@@ -1,0 +1,237 @@
+def format_factum_single_source_prompt(question, chunks_list):
+    # Les documents sources sont balisés individuellement pour délimiter T_C
+    docs_formatted = "\n\n".join(
+        [f"[Source: {c['id']}] {c['text'].strip()}" for c in chunks_list]
+    )
+
+    system_prompt = (
+        "You are an expert multilingual research assistant specialized in faithful information extraction.\n\n"
+        "### OPERATIONAL GUIDELINES:\n"
+        "1. LANGUAGE CONSISTENCY:\n"
+        "   - Identify the language of the user query and reply strictly in that exact same language.\n\n"
+        "2. GROUNDING & STRICT ATOMIC CITATIONS:\n"
+        "   - ATOMIC RULE: Exactly ONE source per factual statement. Each single claim must end with [Source: ID].\n"
+        "   - NEVER group citations together (e.g., [Source: 1, 2] is forbidden).\n"
+        "   - Split sentences if multiple sources are required.\n"
+        "   - Only cite a source if the fact is explicitly supported by it.\n\n"
+        "3. OUTPUT FORMAT:\n"
+        "   - Provide ONLY the direct, cited answer. No introductory or concluding chatter."
+    )
+
+    few_shot_examples = (
+        "--- EXAMPLE 1 (FRENCH) ---\n"
+        "Context Documents:\n"
+        "[Source: 0] L'observatoire du Pic du Midi est situé dans les Hautes-Pyrénées à 2 877 mètres d'altitude.\n"
+        "[Source: 1] La construction de l'observatoire a commencé en 1878 sous la direction du général de Nansouty.\n\n"
+        "Question: Où se trouve l'observatoire du Pic du Midi et qui a dirigé le début de sa construction ?\n\n"
+        "Answer:\n"
+        "L'observatoire du Pic du Midi est situé dans les Hautes-Pyrénées à 2 877 mètres d'altitude [Source: 0]. Le début de sa construction a été dirigé par le général de Nansouty en 1878 [Source: 1].\n\n"
+    )
+
+    user_prompt = (
+        f"{few_shot_examples}"
+        f"--- REAL TASK ---\n"
+        f"Context Documents:\n"
+        f"{docs_formatted}\n\n"
+        f"Question: {question}\n\n"
+        f"Answer:"
+    )
+
+    return system_prompt, user_prompt, docs_formatted
+
+
+
+
+
+
+
+
+import re
+import torch
+
+def generate_and_locate_target(model, tokenizer, system_prompt, user_prompt, docs_formatted):
+    # 1. Construction du template de chat
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    prompt_str = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    prompt_inputs = tokenizer(prompt_str, return_tensors="pt").to(model.device)
+    prompt_len = prompt_inputs.input_ids.shape[1]
+
+    # 2. Génération greedy de la réponse
+    with torch.no_grad():
+        gen_outputs = model.generate(**prompt_inputs, max_new_tokens=256, do_sample=False)
+
+    generated_ids = gen_outputs[0][prompt_len:]
+    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+    # 3. Concaténation complète pour alignement des tokens
+    full_sequence_ids = gen_outputs[0]
+    
+    # 4. Délimitation des indices de T_C (les documents sources dans le prompt)
+    # On repère où se trouve le texte des contextes dans la séquence de tokens
+    docs_tokens = tokenizer(docs_formatted, add_special_tokens=False).input_ids
+    # Recherche naïve de sous-liste pour isoler la plage de tokens T_C
+    input_ids_list = full_sequence_ids.tolist()
+    tc_start = 0
+    for idx in range(len(input_ids_list) - len(docs_tokens) + 1):
+        if input_ids_list[idx:idx+len(docs_tokens)] == docs_tokens:
+            tc_start = idx
+            break
+    tc_indices = list(range(tc_start, tc_start + len(docs_tokens)))
+
+    # 5. Extraction des positions des chiffres de citation
+    citations_info = []
+    for match in re.finditer(r"\[Source:\s*(\d+)\]", generated_text):
+        source_id_str = match.group(1)
+        # Position du chiffre dans la sous-séquence générée
+        char_idx_in_gen = match.start(1)
+        
+        # Mapping caractère -> token index
+        prefix_gen = generated_text[:char_idx_in_gen]
+        prefix_tokens = tokenizer(prefix_gen, add_special_tokens=False).input_ids
+        target_token_index = prompt_len + len(prefix_tokens)
+        
+        citations_info.append({
+            "source_id": source_id_str,
+            "token_index": target_token_index
+        })
+
+    return full_sequence_ids, tc_indices, citations_info, generated_text
+
+
+
+
+
+
+import torch
+import torch.nn.functional as F
+
+def compute_factum_scores(model, full_sequence_ids, tc_indices, target_token_index):
+    input_ids = full_sequence_ids.unsqueeze(0).to(model.device)
+    
+    # Structures pour enregistrer les états intermédiaires via PyTorch Hooks
+    layer_inputs = {}
+    pre_ffn_states = {}
+    post_ffn_states = {}
+    
+    def get_layer_input_hook(layer_idx):
+        def hook(module, inp, out):
+            # x_{input}^{(l)}
+            layer_inputs[layer_idx] = inp[0].detach()
+        return hook
+
+    def get_pre_ffn_hook(layer_idx):
+        def hook(module, inp, out):
+            # x_{pre-ffn}^{(l)} (sortie du bloc Attention + résidu)
+            pre_ffn_states[layer_idx] = inp[0].detach()
+        return hook
+
+    def get_post_ffn_hook(layer_idx):
+        def hook(module, inp, out):
+            # x_{post-ffn}^{(l)} (après application du FFN)
+            # Dans LlamaDecoderLayer, la sortie du layer correspond à x_{post-ffn}^{(l)}
+            post_ffn_states[layer_idx] = out[0].detach()
+        return hook
+
+    # Enregistrement des hooks sur chaque couche LlamaDecoderLayer
+    hooks = []
+    for l_idx, layer in enumerate(model.model.layers):
+        hooks.append(layer.register_forward_hook(get_layer_input_hook(l_idx)))
+        hooks.append(layer.mlp.register_forward_hook(get_pre_ffn_hook(l_idx)))
+        hooks.append(layer.register_forward_hook(get_post_ffn_hook(l_idx)))
+
+    # Passe avant complète avec récupération des hidden states et attentions
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids,
+            output_hidden_states=True,
+            output_attentions=True
+        )
+
+    # Nettoyage des hooks
+    for h in hooks:
+        h.remove()
+
+    num_layers = len(model.model.layers)
+    final_hidden_states = outputs.hidden_states[-1][0]  # h^{(L)}
+    h_ti = final_hidden_states[target_token_index]      # h_{t_i}^{(L)}
+    
+    # Indices T_C sous forme de tenseur
+    tc_tensor = torch.tensor(tc_indices, device=model.device, dtype=torch.long)
+    h_tc = final_hidden_states[tc_tensor]               # h_{t_j}^{(L)} pour tout j dans T_C
+
+    cas_per_layer_head = []
+    bas_per_layer_head = []
+    pfs_per_layer = []
+    pas_per_layer = []
+
+    for l in range(num_layers):
+        # 1. Vecteurs résiduels
+        x_input = layer_inputs[l][0, target_token_index]
+        x_pre_ffn = pre_ffn_states[l][0, target_token_index]
+        x_post_ffn = post_ffn_states[l][0, target_token_index]
+
+        v_attn = x_pre_ffn - x_input   # v_{attn}^{(l)}
+        v_ffn = x_post_ffn - x_pre_ffn # v_{ffn}^{(l)}
+
+        # 2. PFS - Norme L2 de v_ffn
+        pfs = torch.linalg.norm(v_ffn, ord=2).item()
+        pfs_per_layer.append(pfs)
+
+        # 3. PAS - Cosine Similarity entre v_attn et v_ffn
+        pas = F.cosine_similarity(v_attn.unsqueeze(0), v_ffn.unsqueeze(0)).item()
+        pas_per_layer.append(pas)
+
+        # 4. BAS et CAS par tête
+        attn_matrix_l = outputs.attentions[l][0]  # Shape: (num_heads, seq_len, seq_len)
+        num_heads = attn_matrix_l.shape[0]
+
+        for h in range(num_heads):
+            # BAS : Attention portée sur le premier token (indice 0 / <s>)
+            bas = attn_matrix_l[h, target_token_index, 0].item()
+            bas_per_layer_head.append(bas)
+
+            # CAS : Similarité cosinus avec le vecteur de contexte pondéré
+            attn_weights_tc = attn_matrix_l[h, target_token_index, tc_tensor] # A_{i, j}^{h, l}
+            
+            # Somme pondérée des hidden states finaux de T_C
+            context_vector = torch.sum(attn_weights_tc.unsqueeze(-1) * h_tc, dim=0) # sum(A * h_j)
+            
+            # Cosine similarity entre context_vector et h_{t_i}
+            cas = F.cosine_similarity(context_vector.unsqueeze(0), h_ti.unsqueeze(0)).item()
+            cas_per_layer_head.append(cas)
+
+    return {
+        "CAS_raw": cas_per_layer_head, # 32 layers * 32 heads = 1024 valeurs
+        "BAS_raw": bas_per_layer_head, # 1024 valeurs
+        "PFS_raw": pfs_per_layer,      # 32 valeurs
+        "PAS_raw": pas_per_layer       # 32 valeurs
+    }
+
+
+
+
+
+import numpy as np
+
+def aggregate_factum_features(raw_metrics):
+    """
+    Agrégation synthétique des vecteurs bruts en 4 caractéristiques
+    (représentant la simplification du pipeline de réduction décrit section 4.5 du papier).
+    """
+    cas_feature = float(np.mean(raw_metrics["CAS_raw"]))
+    bas_feature = float(np.mean(raw_metrics["BAS_raw"]))
+    pfs_feature = float(np.mean(raw_metrics["PFS_raw"]))
+    pas_feature = float(np.mean(raw_metrics["PAS_raw"]))
+
+    return np.array([[cas_feature, bas_feature, pfs_feature, pas_feature]])
+
+def predict_citation_validity(clf, aggregated_features):
+    # clf est le modèle LogisticRegression préalablement ajusté
+    # 0 = Correct, 1 = Hallucinated
+    prob_hallucination = clf.predict_proba(aggregated_features)[0, 1]
+    is_hallucinated = prob_hallucination > 0.5
+    
+    return is_hallucinated, prob_hallucination

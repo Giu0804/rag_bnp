@@ -1,0 +1,178 @@
+import gc
+import json
+import re
+import pandas as pd
+import torch
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# ==========================================================
+# CONFIGURATION
+# ==========================================================
+MODEL_ID = "google/gemma-2-27b-it"  # Ton modèle exact
+ATTENTION_THRESHOLD = 0.015         # Seuil tau post-hoc (ajustable)
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    attn_implementation="eager"  # Obligatoire pour extraire les tenseurs d'attention
+)
+model.eval()
+
+
+def build_prompt_and_get_doc_spans(contexts_list, question):
+    """
+    Construit le texte du prompt et relève directement
+    les positions de caractères (start, end) de chaque document.
+    """
+    prompt_parts = ["Contexts:\n"]
+    current_char_idx = len(prompt_parts[0])
+    doc_spans = {}
+
+    for ctx in contexts_list:
+        doc_id = int(ctx["id"])
+        doc_text = str(ctx["text"])
+
+        header = f"[{doc_id}] "
+        prompt_parts.append(header)
+        current_char_idx += len(header)
+
+        start_c = current_char_idx
+        prompt_parts.append(doc_text)
+        current_char_idx += len(doc_text)
+        end_c = current_char_idx
+
+        doc_spans[doc_id] = (start_c, end_c)
+
+        prompt_parts.append("\n\n")
+        current_char_idx += 2
+
+    suffix = f"Question: {question}\nAnswer:"
+    prompt_parts.append(suffix)
+
+    full_prompt_text = "".join(prompt_parts)
+    return full_prompt_text, doc_spans
+
+
+# ==========================================================
+# EXTRACTION D'ATTENTION EN TEACHER FORCING (BATCH SIZE = 1)
+# ==========================================================
+def compute_attention_per_snippet(prompt_text, inline_processed, doc_spans):
+    """
+    Exécute un forward pass unique et calcule les scores d'attention
+    de chaque snippet vers chaque document source selon l'Équation 4.
+    """
+    # 1. Reconstitution du texte complet généré
+    generated_text = "".join([item["text"] for item in inline_processed])
+    full_sequence = prompt_text + generated_text
+    prompt_len_chars = len(prompt_text)
+
+    # 2. Tokenisation avec offset mapping
+    encoding = tokenizer(full_sequence, return_tensors="pt", return_offsets_mapping=True)
+    input_ids = encoding.input_ids.to(model.device)
+    offsets = encoding.offset_mapping[0].tolist()
+
+    # 3. Forward pass
+    with torch.no_grad():
+        outputs = model(input_ids, output_attentions=True)
+
+    # 4. Mapper les documents vers les index de tokens
+    doc_token_map = {}
+    for d_id, (s_c, e_c) in doc_spans.items():
+        doc_token_map[d_id] = [
+            idx for idx, (tok_s, tok_e) in enumerate(offsets)
+            if tok_s >= s_c and tok_e <= e_c and tok_s < tok_e
+        ]
+
+    # 5. Localiser les tokens de chaque snippet et calculer son score d'attention
+    attention_scores = {}  # {snippet_id: {doc_id: score}}
+    current_char_offset = prompt_len_chars
+
+    for item in inline_processed:
+        sid = item["snippet_id"]
+        snip_text = item["text"]
+        
+        snip_start = current_char_offset
+        snip_end = snip_start + len(snip_text)
+        current_char_offset = snip_end
+
+        snip_toks = [
+            idx for idx, (tok_s, tok_e) in enumerate(offsets)
+            if tok_s >= snip_start and tok_e <= snip_end and tok_s < tok_e
+        ]
+
+        if not snip_toks:
+            continue
+
+        attention_scores[sid] = {d_id: 0.0 for d_id in doc_token_map.keys()}
+
+        # Calcul Équation 4 (Somme doc, moyenne snippet, moyenne couches/têtes)
+        for layer_attn in outputs.attentions:
+            layer_squeezed = layer_attn[0]  # (num_heads, seq_len, seq_len)
+            for d_id, d_toks in doc_token_map.items():
+                if not d_toks:
+                    continue
+                sub_attn = layer_squeezed[:, snip_toks, :][:, :, d_toks]
+                head_scores = sub_attn.sum(dim=-1).mean(dim=-1)
+                attention_scores[sid][d_id] += head_scores.mean().item()
+
+        num_layers = len(outputs.attentions)
+        for d_id in attention_scores[sid]:
+            attention_scores[sid][d_id] /= num_layers
+
+    # Nettoyage mémoire
+    del outputs, input_ids, encoding
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return attention_scores
+
+# ==========================================================
+# TRAITEMENT DU DATAFRAME ET CRÉATION DE LA NOUVELLE COLONNE
+# ==========================================================
+def process_dataset(df):
+    new_inline_processed_list = []
+
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Extraction Attention"):
+        prompt_text = f"Contexts:\n{row['contexts']}\nQuestion: {row['question']}\nAnswer:"
+        inline_processed = row["inline_processed"]
+        
+        # Récupération des positions des documents
+        doc_spans = extract_doc_char_spans(prompt_text)
+        
+        # Extraction des attentions
+        attn_scores = compute_attention_per_snippet(prompt_text, inline_processed, doc_spans)
+        
+        # Construction de la nouvelle structure enrichie
+        sample_enriched_inline = []
+        for item in inline_processed:
+            sid = item["snippet_id"]
+            # Citations de base issues de la génération
+            current_cits = set(item.get("citation", []))
+            
+            # Post-hoc : ajout si l'attention interne dépasse le seuil tau
+            snip_scores = attn_scores.get(sid, {})
+            for d_id, score in snip_scores.items():
+                if score > ATTENTION_THRESHOLD:
+                    current_cits.add(d_id)
+            
+            sample_enriched_inline.append({
+                "snippet_id": sid,
+                "text": item["text"],
+                "citation": sorted(list(current_cits))
+            })
+            
+        new_inline_processed_list.append(sample_enriched_inline)
+
+    # Création directe de la nouvelle colonne
+    df["inline_processed_attention"] = new_inline_processed_list
+    return df
+
+# Exécution :
+# df = process_dataset(df)
+# df.to_json("df_with_attention_citations.json", orient="records")
+
+
+sur tout ce code avec ce qu on vient de dire c quoi qui dit ête modifié

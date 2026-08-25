@@ -1,0 +1,338 @@
+import json
+import re
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from openai import OpenAI
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.model_selection import train_test_split
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# ==============================================================================
+# BRIQUE 1 : CHARGEMENT DU MODÈLE ET DU TOKENIZER
+# Rôle : Charger Llama-3.1-8B-Instruct avec gestion des états cachés et de l'attention.
+# ==============================================================================
+model_id = "meta-llama/Llama-3.1-8B-Instruct"
+
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    low_cpu_mem_usage=True,
+)
+
+
+# ==============================================================================
+# BRIQUE 2 : PROMPTING (RÈGLE ATOMIQUE & MULTILINGUE)
+# Rôle : Forcer le modèle à répondre dans la langue de la question et à associer
+#        exactement une citation [Source: ID] par affirmation factuelle.
+# ==============================================================================
+def format_factum_single_source_prompt(question, chunks_list):
+    # Concaténation des chunks avec balises [Source: ID]
+    docs_formatted = "\n\n".join(
+        [f"[Source: {c['id']}] {c['text'].strip()}" for c in chunks_list]
+    )
+
+    system_prompt = (
+        "You are an expert multilingual research assistant specialized in faithful information extraction.\n\n"
+        "### OPERATIONAL GUIDELINES:\n"
+        "1. LANGUAGE CONSISTENCY:\n"
+        "   - Identify the language of the user query and reply strictly in that exact same language.\n\n"
+        "2. GROUNDING & STRICT ATOMIC CITATIONS:\n"
+        "   - ATOMIC RULE: Exactly ONE source per factual statement. Each single claim must end with [Source: ID].\n"
+        "   - NEVER group citations together (e.g., [Source: 1, 2] is forbidden).\n"
+        "   - Split sentences if multiple sources are required.\n"
+        "   - Only cite a source if the fact is explicitly supported by it.\n\n"
+        "3. OUTPUT FORMAT:\n"
+        "   - Provide ONLY the direct, cited answer. No introductory or concluding chatter."
+    )
+
+    few_shot_examples = (
+        "--- EXAMPLE 1 (FRENCH) ---\n"
+        "Context Documents:\n"
+        "[Source: 0] L'observatoire du Pic du Midi est situé dans les Hautes-Pyrénées à 2 877 mètres d'altitude.\n"
+        "[Source: 1] La construction de l'observatoire a commencé en 1878 sous la direction du général de Nansouty.\n\n"
+        "Question: Où se trouve l'observatoire du Pic du Midi et qui a dirigé le début de sa construction ?\n\n"
+        "Answer:\n"
+        "L'observatoire du Pic du Midi est situé dans les Hautes-Pyrénées à 2 877 mètres d'altitude [Source: 0]. Le début de sa construction a été dirigé par le général de Nansouty en 1878 [Source: 1].\n\n"
+    )
+
+    user_prompt = (
+        f"{few_shot_examples}"
+        f"--- REAL TASK ---\n"
+        f"Context Documents:\n"
+        f"{docs_formatted}\n\n"
+        f"Question: {question}\n\n"
+        f"Answer:"
+    )
+
+    return system_prompt, user_prompt, docs_formatted
+
+
+# ==============================================================================
+# BRIQUE 3 : GÉNÉRATION ET REPÉRAGE DU TOKEN DE CITATION
+# Rôle : 1. Générer la réponse brute.
+#        2. Repérer l'intervalle de tokens des documents sources (T_C).
+#        3. Trouver l'indice exact du token désignant l'ID source (ex. '0').
+# ==============================================================================
+def generate_and_locate_target(
+    model, tokenizer, system_prompt, user_prompt, docs_formatted
+):
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    prompt_str = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    prompt_inputs = tokenizer(prompt_str, return_tensors="pt").to(model.device)
+    prompt_len = prompt_inputs.input_ids.shape[1]
+
+    # Génération déterministe (greedy)
+    with torch.no_grad():
+        gen_outputs = model.generate(
+            **prompt_inputs, max_new_tokens=256, do_sample=False
+        )
+
+    full_sequence_ids = gen_outputs[0]
+    generated_ids = full_sequence_ids[prompt_len:]
+    generated_text = tokenizer.decode(
+        generated_ids, skip_special_tokens=True
+    ).strip()
+
+    # Repérage de l'intervalle T_C (tokens des documents sources dans le prompt)
+    docs_tokens = tokenizer(docs_formatted, add_special_tokens=False).input_ids
+    input_ids_list = full_sequence_ids.tolist()
+    tc_start = 0
+    for idx in range(len(input_ids_list) - len(docs_tokens) + 1):
+        if input_ids_list[idx : idx + len(docs_tokens)] == docs_tokens:
+            tc_start = idx
+            break
+    tc_indices = list(range(tc_start, tc_start + len(docs_tokens)))
+
+    # Extraction des tokens de citation
+    citations_info = []
+    for match in re.finditer(r"\[Source:\s*(\d+)\]", generated_text):
+        source_id_str = match.group(1)
+        char_idx_in_gen = match.start(1)
+
+        prefix_gen = generated_text[:char_idx_in_gen]
+        prefix_tokens = tokenizer(
+            prefix_gen, add_special_tokens=False
+        ).input_ids
+        target_token_index = prompt_len + len(prefix_tokens)
+
+        citations_info.append(
+            {"source_id": source_id_str, "token_index": target_token_index}
+        )
+
+    return full_sequence_ids, tc_indices, citations_info, generated_text
+
+
+# ==============================================================================
+# BRIQUE 4 : EXTRACTION MÉCANISTIQUE FACTUM
+# Rôle : Mesurer via PyTorch Hooks les 4 grandeurs internes sur le token cible :
+#        - CAS (Ancrage contextuel via Cosine Similarity)
+#        - BAS (Attention portée sur le token <s>)
+#        - PFS (Norme L2 de la mise à jour du FFN)
+#        - PAS (Similarité Cosinus entre Attention et FFN)
+# ==============================================================================
+def compute_factum_scores(
+    model, full_sequence_ids, tc_indices, target_token_index
+):
+    input_ids = full_sequence_ids.unsqueeze(0).to(model.device)
+
+    layer_inputs = {}
+    pre_ffn_states = {}
+    post_ffn_states = {}
+
+    def get_layer_input_hook(l_idx):
+        def hook(module, inp, out):
+            layer_inputs[l_idx] = inp[0].detach()
+
+        return hook
+
+    def get_pre_ffn_hook(l_idx):
+        def hook(module, inp, out):
+            pre_ffn_states[l_idx] = inp[0].detach()
+
+        return hook
+
+    def get_post_ffn_hook(l_idx):
+        def hook(module, inp, out):
+            post_ffn_states[l_idx] = out[0].detach()
+
+        return hook
+
+    hooks = []
+    for l_idx, layer in enumerate(model.model.layers):
+        hooks.append(layer.register_forward_hook(get_layer_input_hook(l_idx)))
+        hooks.append(layer.mlp.register_forward_hook(get_pre_ffn_hook(l_idx)))
+        hooks.append(layer.register_forward_hook(get_post_ffn_hook(l_idx)))
+
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids,
+            output_hidden_states=True,
+            output_attentions=True,
+        )
+
+    for h in hooks:
+        h.remove()
+
+    num_layers = len(model.model.layers)
+    final_hidden_states = outputs.hidden_states[-1][0]
+    h_ti = final_hidden_states[target_token_index]
+
+    tc_tensor = torch.tensor(tc_indices, device=model.device, dtype=torch.long)
+    h_tc = final_hidden_states[tc_tensor]
+
+    cas_list, bas_list, pfs_list, pas_list = [], [], [], []
+
+    for l in range(num_layers):
+        x_input = layer_inputs[l][0, target_token_index]
+        x_pre_ffn = pre_ffn_states[l][0, target_token_index]
+        x_post_ffn = post_ffn_states[l][0, target_token_index]
+
+        v_attn = x_pre_ffn - x_input
+        v_ffn = x_post_ffn - x_pre_ffn
+
+        # PFS : Norme L2 du vecteur FFN
+        pfs_list.append(torch.linalg.norm(v_ffn, ord=2).item())
+
+        # PAS : Cosine similarity entre v_attn et v_ffn
+        pas_list.append(
+            F.cosine_similarity(v_attn.unsqueeze(0), v_ffn.unsqueeze(0)).item()
+        )
+
+        attn_matrix_l = outputs.attentions[l][0]
+        num_heads = attn_matrix_l.shape[0]
+
+        for h in range(num_heads):
+            # BAS : Poids sur le premier token
+            bas_list.append(attn_matrix_l[h, target_token_index, 0].item())
+
+            # CAS : Similarité cosinus entre context vector et hidden state cible
+            attn_weights_tc = attn_matrix_l[h, target_token_index, tc_tensor]
+            context_vector = torch.sum(
+                attn_weights_tc.unsqueeze(-1) * h_tc, dim=0
+            )
+            cas = F.cosine_similarity(
+                context_vector.unsqueeze(0), h_ti.unsqueeze(0)
+            ).item()
+            cas_list.append(cas)
+
+    # Réduction en 4 features agrégées [CAS, BAS, PFS, PAS]
+    return np.array(
+        [
+            float(np.mean(cas_list)),
+            float(np.mean(bas_list)),
+            float(np.mean(pfs_list)),
+            float(np.mean(pas_list)),
+        ]
+    )
+
+
+# ==============================================================================
+# BRIQUE 5 : LE LLM JUGE (GROUND TRUTH OFFLINE)
+# Rôle : Utiliser un modèle externe (Llama-70B) pour déterminer si l'affirmation
+#        générée est factuellement supportée par le document cité (0 = Vrai, 1 = Faux).
+# ==============================================================================
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="sk-local")
+
+
+def judge_citation_with_llm(claim_text, cited_doc_text):
+    prompt = f"""You are an impartial evaluator for citation faithfulness.
+
+Document:
+\"\"\"{cited_doc_text}\"\"\"
+
+Claim:
+\"\"\"{claim_text}\"\"\"
+
+Is this Claim fully supported by the Document?
+Reply strictly with JSON: {{"supported": true}} or {{"supported": false}}."""
+
+    try:
+        response = client.chat.completions.create(
+            model="meta-llama/Llama-3.1-70B-Instruct",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+        )
+        data = json.loads(response.choices[0].message.content.strip())
+        # 0 = Citation Correcte, 1 = Citation Hallucinée
+        return 0 if data.get("supported", False) else 1
+    except Exception:
+        return 1
+
+
+# ==============================================================================
+# BRIQUE 6 : EXÉCUTION DU DATASET, ENTRAÎNEMENT & ÉVALUATION DU CLASSIFIEUR
+# Rôle : Parcourir df, collecter X (scores Llama-8B) et Y (labels LLM Juge),
+#        entraîner la Régression Logistique et mesurer l'AUC-ROC.
+# ==============================================================================
+def run_full_factum_benchmark(df, model, tokenizer):
+    X_data = []
+    y_data = []
+
+    for idx, row in df.iterrows():
+        question = row["question"]
+        chunks_list = row["contexts"]
+        chunks_dict = {str(c["id"]): c["text"] for c in chunks_list}
+
+        # 1. Génération et extraction
+        sys_p, usr_p, docs_fmt = format_factum_single_source_prompt(
+            question, chunks_list
+        )
+        full_ids, tc_idx, citations, gen_text = generate_and_locate_target(
+            model, tokenizer, sys_p, usr_p, docs_fmt
+        )
+
+        for cit in citations:
+            s_id = cit["source_id"]
+            if s_id not in chunks_dict:
+                continue
+
+            # X : Features extraites de Llama-8B
+            features = compute_factum_scores(
+                model, full_ids, tc_idx, cit["token_index"]
+            )
+
+            # Y : Label attribué par le LLM Juge
+            label = judge_citation_with_llm(gen_text, chunks_dict[s_id])
+
+            X_data.append(features)
+            y_data.append(label)
+
+    X = np.array(X_data)
+    y = np.array(y_data)
+
+    # Séparation Apprentissage / Test
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.3, random_state=42, stratify=y
+    )
+
+    # Entraînement de la Régression Logistique FACTUM
+    detector = LogisticRegression(class_weight="balanced")
+    detector.fit(X_train, y_train)
+
+    # Évaluation
+    y_probs = detector.predict_proba(X_test)[:, 1]
+    y_preds = detector.predict(X_test)
+
+    print("==========================================")
+    print(f"FACTUM AUC-ROC : {roc_auc_score(y_test, y_probs):.4f}")
+    print("==========================================")
+    print(
+        classification_report(
+            y_test, y_preds, target_names=["Correct (0)", "Hallucination (1)"]
+        )
+    )
+
+    return detector

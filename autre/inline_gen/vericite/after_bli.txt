@@ -1,0 +1,116 @@
+import os
+import json
+import pandas as pd
+from openai import OpenAI
+
+# =====================================================================
+# 1. FONCTION DE GÉNÉRATION PURE
+# =====================================================================
+def generate_qwen(system_prompt: str, user_prompt: str, client: OpenAI, model_name: str = "Qwen/Qwen2.5-7B-Instruct") -> str:
+    """
+    Appelle l'API Qwen avec les prompts fournis et retourne uniquement la réponse textuelle.
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            temperature=0.0, # Déterministe
+            max_tokens=512
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[ERREUR API] : {e}")
+        return ""
+
+
+# =====================================================================
+# 2. FONCTION PRINCIPALE (ITÉRATION, PRINT ET LOG)
+# =====================================================================
+def run_generation(input_file: str, output_file: str):
+    """
+    Charge le dataset, génère la réponse pour chaque ligne, l'affiche, 
+    et sauvegarde les résultats dans un nouveau dataset.
+    """
+    # 1. Initialisation de l'API
+    client = OpenAI(
+        base_url="http://localhost:8000/v1", # À adapter selon ton serveur
+        api_key="EMPTY"
+    )
+    model_name = "Qwen/Qwen2.5-7B-Instruct"
+
+    # 2. Chargement du dataset issu du NLI
+    print(f"Chargement des données depuis : {input_file}")
+    df = pd.read_json(input_file)
+    
+    # 3. Prompts statiques
+    system_prompt = """You are a factual synthesis engine.
+Write a clear answer to the user question using ONLY the provided verified premises.
+Every statement deriving from a premise MUST end with its exact citation tag containing JUST THE ID VALUE (e.g., [1] or [1][3]).
+Statements marked [NO CITATION NEEDED] must be included naturally WITHOUT brackets.
+Do NOT include meta-commentary."""
+
+    user_template = """[QUESTION]
+{question}
+
+[VERIFIED PREMISES]
+{premises}"""
+
+    # Liste pour stocker les résultats au fur et à mesure
+    updated_records = []
+
+    # 4. Boucle de génération
+    for index, row in df.iterrows():
+        question = row.get("question", "")
+        diagnostics = row.get("claims_diagnostic", [])
+        
+        # Formatage des prémisses pour cette ligne
+        verified_lines = []
+        for item in diagnostics:
+            claim = item.get("claim_text", "").strip()
+            if item.get("is_abstention"):
+                verified_lines.append(f"- Premise: \"{claim}\" | Citation: [NO CITATION NEEDED]")
+            elif item.get("is_supported") and item.get("supporting_chunks"):
+                tags = "".join([f"[{str(c).strip()}]" for c in item["supporting_chunks"]])
+                verified_lines.append(f"- Premise: \"{claim}\" | Citation: {tags}")
+        
+        premises_text = "\n".join(verified_lines) if verified_lines else "EMPTY"
+        user_prompt = user_template.format(question=question, premises=premises_text)
+
+        # -------------------------------------------------
+        # APPEL DE LA GÉNÉRATION
+        # -------------------------------------------------
+        print(f"\n--- Génération ligne {index} ---")
+        print(f"Question : {question}")
+        
+        answer = generate_qwen(system_prompt, user_prompt, client, model_name)
+        
+        print(f"Réponse générée : \n{answer}\n")
+        
+        # -------------------------------------------------
+        # LOGGING
+        # -------------------------------------------------
+        row_dict = row.to_dict()
+        row_dict["vericite_answer"] = answer
+        updated_records.append(row_dict)
+
+    # 5. Sauvegarde dans un nouveau dataset
+    print(f"\nSauvegarde de {len(updated_records)} lignes dans : {output_file}")
+    df_output = pd.DataFrame(updated_records)
+    df_output.to_json(output_file, orient="records", indent=2, force_ascii=False)
+    print("Processus terminé avec succès.")
+
+
+# =====================================================================
+# 3. LANCEMENT
+# =====================================================================
+if __name__ == "__main__":
+    # Il te suffit de lancer cette fonction avec tes noms de fichiers
+    run_generation(
+        input_file="dataset_after_nli.json", 
+        output_file="dataset_vericite_final.json"
+    )

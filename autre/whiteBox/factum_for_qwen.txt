@@ -1,0 +1,180 @@
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+model_id = "Qwen/Qwen3-14B"  # Ou "Qwen/Qwen2.5-14B-Instruct"
+
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# Chargement en bfloat16 avec FlashAttention-2 pour gérer l'empreinte mémoire
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    attn_implementation="flash_attention_2",  # Fortement recommandé pour 14B
+    low_cpu_mem_usage=True
+)
+
+
+
+
+def generate_and_locate_target_qwen(model, tokenizer, system_prompt, user_prompt, docs_formatted):
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    
+    # NOTE QWEN : On force enable_thinking=False si supporté par le chat_template
+    try:
+        prompt_str = tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True,
+            enable_thinking=False
+        )
+    except TypeError:
+        # Fallback pour templates standards
+        prompt_str = tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+
+    prompt_inputs = tokenizer(prompt_str, return_tensors="pt").to(model.device)
+    prompt_len = prompt_inputs.input_ids.shape[1]
+
+    # Génération greedy
+    with torch.no_grad():
+        gen_outputs = model.generate(
+            **prompt_inputs, 
+            max_new_tokens=256, 
+            do_sample=False
+        )
+
+    full_sequence_ids = gen_outputs[0]
+    generated_ids = full_sequence_ids[prompt_len:]
+    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+    # Repérage de T_C
+    docs_tokens = tokenizer(docs_formatted, add_special_tokens=False).input_ids
+    input_ids_list = full_sequence_ids.tolist()
+    tc_start = 0
+    for idx in range(len(input_ids_list) - len(docs_tokens) + 1):
+        if input_ids_list[idx:idx+len(docs_tokens)] == docs_tokens:
+            tc_start = idx
+            break
+    tc_indices = list(range(tc_start, tc_start + len(docs_tokens)))
+
+    # Extraction des tokens cibles
+    citations_info = []
+    for match in re.finditer(r"\[Source:\s*(\d+)\]", generated_text):
+        source_id_str = match.group(1)
+        char_idx_in_gen = match.start(1)
+        
+        prefix_gen = generated_text[:char_idx_in_gen]
+        prefix_tokens = tokenizer(prefix_gen, add_special_tokens=False).input_ids
+        target_token_index = prompt_len + len(prefix_tokens)
+        
+        citations_info.append({
+            "source_id": source_id_str,
+            "token_index": target_token_index
+        })
+
+    return full_sequence_ids, tc_indices, citations_info, generated_text
+
+
+
+
+
+
+
+import torch.nn.functional as F
+import numpy as np
+
+def compute_factum_scores_qwen(model, full_sequence_ids, tc_indices, target_token_index):
+    # On s'assure d'envoyer l'entrée sur le device de la première couche
+    first_device = model.model.layers[0].self_attn.q_proj.weight.device
+    input_ids = full_sequence_ids.unsqueeze(0).to(first_device)
+    
+    layer_inputs = {}
+    pre_ffn_states = {}
+    post_ffn_states = {}
+
+    def get_layer_input_hook(l_idx):
+        def hook(module, inp, out):
+            # Capture sur CPU pour éviter de saturer la VRAM sur 14B
+            layer_inputs[l_idx] = inp[0][:, target_token_index, :].detach().cpu()
+        return hook
+
+    def get_pre_ffn_hook(l_idx):
+        def hook(module, inp, out):
+            pre_ffn_states[l_idx] = inp[0][:, target_token_index, :].detach().cpu()
+        return hook
+
+    def get_post_ffn_hook(l_idx):
+        def hook(module, inp, out):
+            post_ffn_states[l_idx] = out[0][:, target_token_index, :].detach().cpu()
+        return hook
+
+    # Qwen utilise `model.model.layers` (40 ou 48 couches)
+    hooks = []
+    for l_idx, layer in enumerate(model.model.layers):
+        hooks.append(layer.register_forward_hook(get_layer_input_hook(l_idx)))
+        hooks.append(layer.mlp.register_forward_hook(get_pre_ffn_hook(l_idx)))
+        hooks.append(layer.register_forward_hook(get_post_ffn_hook(l_idx)))
+
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids,
+            output_hidden_states=True,
+            output_attentions=True
+        )
+
+    for h in hooks:
+        h.remove()
+
+    num_layers = len(model.model.layers)
+    
+    # États finaux
+    final_hidden_states = outputs.hidden_states[-1][0].cpu()
+    h_ti = final_hidden_states[target_token_index]
+    
+    tc_tensor = torch.tensor(tc_indices, dtype=torch.long)
+    h_tc = final_hidden_states[tc_tensor]
+
+    cas_list, bas_list, pfs_list, pas_list = [], [], [], []
+
+    for l in range(num_layers):
+        # 1. Vecteurs résiduels (sur CPU)
+        x_input = layer_inputs[l][0]
+        x_pre_ffn = pre_ffn_states[l][0]
+        x_post_ffn = post_ffn_states[l][0]
+
+        v_attn = x_pre_ffn - x_input
+        v_ffn = x_post_ffn - x_pre_ffn
+
+        # PFS & PAS
+        pfs_list.append(torch.linalg.norm(v_ffn, ord=2).item())
+        pas_list.append(F.cosine_similarity(v_attn.unsqueeze(0), v_ffn.unsqueeze(0)).item())
+
+        # 2. Attentions
+        attn_matrix_l = outputs.attentions[l][0].cpu()  # (num_heads, seq_len, seq_len)
+        num_heads = attn_matrix_l.shape[0]  # 40 têtes sur Qwen 14B
+
+        for h in range(num_heads):
+            # BAS (Attention vers token 0)
+            bas_list.append(attn_matrix_l[h, target_token_index, 0].item())
+
+            # CAS (Cosine similarity avec contexte T_C)
+            attn_weights_tc = attn_matrix_l[h, target_token_index, tc_tensor]
+            context_vector = torch.sum(attn_weights_tc.unsqueeze(-1) * h_tc, dim=0)
+            cas = F.cosine_similarity(context_vector.unsqueeze(0), h_ti.unsqueeze(0)).item()
+            cas_list.append(cas)
+
+    return np.array([
+        float(np.mean(cas_list)),
+        float(np.mean(bas_list)),
+        float(np.mean(pfs_list)),
+        float(np.mean(pas_list))
+    ])
