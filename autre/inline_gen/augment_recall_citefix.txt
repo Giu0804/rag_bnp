@@ -631,3 +631,73 @@ res_df = run_lambda_grid_search(df, gt_col='preannotation', lambda_start=0.1, la
 
 # 2. Heatmap sur une valeur choisie (ex: lambda = 0.75)
 plot_heatmap_for_lambda(df, target_lambda=0.75, gt_col='preannotation', gamma=0.85)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def apply_adaptive_validation(row, snippet_scores, stat_mode="mean", gamma=0.85, fallback_tau=0.30):
+    """
+    Enrichit les citations d'un snippet selon la formule :
+    Seuil = gamma * STAT(scores des citations initiales)
+    où STAT peut être 'mean', 'max' ou 'min'.
+    """
+    enriched_snippets = []
+    
+    for item in row["inline_processed"]:
+        sid = int(item["snippet_id"])
+        
+        # Récupération propre des citations actuelles
+        raw_cits = item.get("citations", item.get("citation", []))
+        if isinstance(raw_cits, np.ndarray):
+            base_cits = set(raw_cits.tolist())
+        elif isinstance(raw_cits, list):
+            base_cits = set(raw_cits)
+        else:
+            base_cits = set()
+
+        scores_for_snip = snippet_scores.get(sid, {})
+
+        # 1. Calcul du seuil adaptatif selon l'option choisie
+        if len(base_cits) > 0:
+            initial_scores = [scores_for_snip.get(int(c), 0.0) for c in base_cits]
+            
+            if stat_mode == "mean":
+                ref_stat = float(np.mean(initial_scores))
+            elif stat_mode == "max":
+                ref_stat = float(np.max(initial_scores))
+            elif stat_mode == "min":
+                ref_stat = float(np.min(initial_scores))
+            else:
+                raise ValueError(f"stat_mode inconnu: {stat_mode}. Choisir parmi 'mean', 'max', 'min'.")
+                
+            adaptive_tau = gamma * ref_stat
+        else:
+            # Si le modèle n'a mis aucune citation au départ
+            adaptive_tau = fallback_tau
+
+        # 2. Enrichissement du set de citations
+        new_cits = set(base_cits)
+        for d_id, score in scores_for_snip.items():
+            if score >= adaptive_tau:
+                new_cits.add(d_id)
+
+        enriched_snippets.append({
+            "snippet_id": sid,
+            "text": item.get("text", ""),
+            "citations": np.array(sorted(list(new_cits)), dtype=int)
+        })
+
+    return enriched_snippets
