@@ -701,3 +701,91 @@ def apply_adaptive_validation(row, snippet_scores, stat_mode="mean", gamma=0.85,
         })
 
     return enriched_snippets
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def run_gamma_grid_search(df, fixed_lambda=0.8, stat_mode="mean", gt_col='preannotation', 
+                          gamma_start=0.5, gamma_end=1.2, step=0.05):
+    """
+    Exécute un Grid Search sur gamma à lambda fixé.
+    Précalcule les scores CiteFix une seule fois par ligne pour aller très vite.
+    """
+    gammas = np.arange(gamma_start, gamma_end + 1e-5, step)
+    results = []
+
+    print(f"\n{'='*95}")
+    print(f"GRID SEARCH SUR GAMMA (Lambda fixé = {fixed_lambda:.2f} | Stat = '{stat_mode}')")
+    print(f"{'='*95}")
+    print(f"{'Gamma':<8} | {'Rappel %':<10} | {'Précision %':<12} | {'F1 %':<8} | {'Exact %':<9} | {'Count %':<9}")
+    print(f"{'-'*95}")
+
+    # 1. OPTIMISATION : Calcul des scores CiteFix une SEULE fois pour tout le dataset
+    cached_scores = []
+    for _, row in df.iterrows():
+        scores = compute_scores_for_sample(row, lambda_val=fixed_lambda)
+        cached_scores.append(scores)
+
+    # 2. Boucle sur les valeurs de gamma
+    for g_val in gammas:
+        g_val = round(g_val, 3)
+        temp_col = []
+
+        for (_, row), scores in zip(df.iterrows(), cached_scores):
+            enriched = apply_adaptive_validation(row, scores, stat_mode=stat_mode, gamma=g_val)
+            temp_col.append(enriched)
+
+        df_temp = df.copy()
+        df_temp["temp_eval_col"] = temp_col
+
+        m = evaluate_per_snippet_metrics(df_temp, gt_col=gt_col, pred_col="temp_eval_col", verbose=False)
+        m["gamma"] = g_val
+        results.append(m)
+
+        print(f"{g_val:<8.2f} | {m['mean_recall']:<10.2f} | {m['mean_precision']:<12.2f} | "
+              f"{m['mean_f1']:<8.2f} | {m['pct_exact']:<9.2f} | {m['pct_count']:<9.2f}")
+
+    print(f"{'='*95}\n")
+    res_df = pd.DataFrame(results)
+
+    # 3. Tracé de la courbe selon gamma
+    plt.figure(figsize=(10, 6))
+    plt.plot(res_df["gamma"], res_df["mean_recall"], marker='o', label="Moyenne Rappel", color="#2ca02c", linewidth=2.5)
+    plt.plot(res_df["gamma"], res_df["mean_precision"], marker='s', label="Moyenne Précision", color="#1f77b4", linewidth=2)
+    plt.plot(res_df["gamma"], res_df["mean_f1"], marker='^', label="Moyenne F1", color="#ff7f0e", linestyle="--")
+    plt.plot(res_df["gamma"], res_df["pct_exact"], marker='d', label="Exact Match", color="#9467bd", linestyle=":")
+
+    plt.title(f"Évolution des Métriques par Snippet selon $\\gamma$ (Tolérance Seuil | $\\lambda={fixed_lambda}$ | Mode='{stat_mode}')", fontsize=12, pad=12)
+    plt.xlabel("Valeur de $\\gamma$ (plus $\\gamma$ est bas, plus on est tolérant et le rappel monte)", fontsize=11)
+    plt.ylabel("Score (%)", fontsize=11)
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.legend(fontsize=11)
+    plt.tight_layout()
+    plt.show()
+
+    return res_df
+
+
+
+
+
+
+# 1. Test avec la moyenne (mean) pour un lambda recommandé par CiteFix (0.8)
+res_mean = run_gamma_grid_search(df, fixed_lambda=0.8, stat_mode="mean", gamma_start=0.5, gamma_end=1.1, step=0.05)
+
+# 2. Test avec le minimum (min) pour un rappel agressif
+res_min = run_gamma_grid_search(df, fixed_lambda=0.8, stat_mode="min", gamma_start=0.7, gamma_end=1.2, step=0.05)
+
+# 3. Test avec le maximum (max)
+res_max = run_gamma_grid_search(df, fixed_lambda=0.8, stat_mode="max", gamma_start=0.5, gamma_end=1.0, step=0.05)
