@@ -1,0 +1,537 @@
+import pickle
+import numpy as np
+import pandas as pd
+import torch
+from tqdm import tqdm
+from typing import List, Dict, Tuple, Optional
+from rouge_score import rouge_scorer
+
+# =========================================================
+# 0. UTILS & NOUVELLES FONCTIONS HALT-RAG
+# =========================================================
+
+def parse_atomic_claims(atomic_claims) -> List[str]:
+    if isinstance(atomic_claims, list):
+        return [str(c).strip() for c in atomic_claims if str(c).strip()]
+    if isinstance(atomic_claims, str):
+        return [f.strip("- *").strip() for f in atomic_claims.split("\n") if f.strip()]
+    return []
+
+def get_windows(text: str, window_size: int = 320, stride: int = 320) -> List[str]:
+    """
+    Découpe le texte en utilisant une fenêtre non chevauchante de 320 tokens avec un pas de 320[cite: 1].
+    Une approche par mots est utilisée ici comme proxy léger pour les tokens.
+    """
+    words = text.split()
+    if not words:
+        return [""]
+    
+    windows = []
+    for i in range(0, len(words), stride):
+        window = " ".join(words[i : i + window_size])
+        windows.append(window)
+    return windows
+
+def compute_lexical_features(claim: str, chunk_window: str) -> dict:
+    """
+    Calcule les features lexicales légères : longueurs, ratios, ROUGE-L et Jaccard[cite: 1].
+    """
+    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+    
+    # Longueurs de séquence[cite: 1]
+    len_claim = len(claim.split())
+    len_chunk = len(chunk_window.split())
+    
+    # Ratios de longueur[cite: 1]
+    length_ratio = len_claim / max(len_chunk, 1)
+    
+    # Similarité Jaccard[cite: 1]
+    set_claim = set(claim.lower().split())
+    set_chunk = set(chunk_window.lower().split())
+    intersection = len(set_claim.intersection(set_chunk))
+    union = len(set_claim.union(set_chunk))
+    jaccard = intersection / max(union, 1)
+    
+    # Chevauchement ROUGE-L[cite: 1]
+    rouge_l_score = scorer.score(chunk_window, claim)['rougeL'].fmeasure
+    
+    return {
+        "len_claim": len_claim,
+        "len_chunk": len_chunk,
+        "length_ratio": length_ratio,
+        "jaccard_sim": jaccard,
+        "rouge_l": rouge_l_score
+    }
+
+
+
+
+
+# =========================================================
+# 1. SCORING CLAIM-LEVEL — NLI (Avec Fenêtrage)
+# =========================================================
+
+def get_claim_level_nli_scores(
+    df: pd.DataFrame, nli_model, batch_size: int = 64, 
+    claims_col: str = "atomic_claims", chunks_col: str = "retrieved_chunks"
+) -> Dict[Tuple, Dict]:
+    
+    all_pairs, all_claims, sample_indices, chunk_ids, window_texts = [], [], [], [], []
+
+    for idx, row in df.iterrows():
+        claims = parse_atomic_claims(row[claims_col])
+        chunks = row.get(chunks_col, []) if isinstance(row, dict) else row[chunks_col]
+        if not claims or not chunks:
+            continue
+            
+        for claim in claims:
+            for chunk in chunks:
+                # Application du fenêtrage sur le chunk
+                windows = get_windows(chunk["text"], window_size=320, stride=320)
+                for window in windows:
+                    all_pairs.append({"text": window, "text_pair": claim})
+                    all_claims.append(claim)
+                    sample_indices.append(idx)
+                    chunk_ids.append(chunk["id"])
+                    window_texts.append(window)
+
+    if not all_pairs:
+        return {}
+
+    nli_best: Dict[Tuple, Dict] = {}
+
+    for i in tqdm(range(0, len(all_pairs), batch_size), desc="NLI inference"):
+        batch = all_pairs[i : i + batch_size]
+        results = nli_model(batch, top_k=None, batch_size=batch_size)
+
+        for j, pair_results in enumerate(results):
+            entail, contradict, neutral = 0.0, 0.0, 0.0
+            items = pair_results if isinstance(pair_results, list) else [pair_results]
+            for item in items:
+                lbl = str(item.get("label", "")).upper()
+                score = item.get("score", 0.0)
+                if "ENTAIL" in lbl: entail = score
+                elif "CONTRADICT" in lbl: contradict = score
+                elif "NEUTRAL" in lbl: neutral = score
+
+            global_idx = i + j
+            key = (sample_indices[global_idx], all_claims[global_idx])
+            
+            # Calcul des features lexicales sur la fenêtre courante
+            lex_feats = compute_lexical_features(all_claims[global_idx], window_texts[global_idx])
+            
+            # Stratégie Max Pooling[cite: 1]
+            prev = nli_best.get(key, {"entail": -1.0})
+            if entail > prev.get("entail", -1.0):
+                nli_best[key] = {
+                    "entail": entail,
+                    "contradict": contradict,
+                    "neutral": neutral,
+                    "best_chunk_id": chunk_ids[global_idx],
+                    "best_chunk_text": window_texts[global_idx],
+                    **lex_feats # On stocke les features lexicales de la meilleure fenêtre
+                }
+
+    return nli_best
+
+
+# =========================================================
+# 2. SCORING CLAIM-LEVEL — RERANKER (Avec Fenêtrage)
+# =========================================================
+
+def get_claim_level_reranker_scores(
+    df: pd.DataFrame, reranker_model, tokenizer, batch_size: int = 128,
+    claims_col: str = "atomic_claims", chunks_col: str = "retrieved_chunks", device: str = "cuda"
+) -> Dict[Tuple, Dict]:
+    
+    all_pairs, all_claims, sample_indices, chunk_ids, window_texts = [], [], [], [], []
+
+    for idx, row in df.iterrows():
+        claims = parse_atomic_claims(row[claims_col])
+        chunks = row.get(chunks_col, []) if isinstance(row, dict) else row[chunks_col]
+        if not claims or not chunks:
+            continue
+            
+        for claim in claims:
+            for chunk in chunks:
+                windows = get_windows(chunk["text"], window_size=320, stride=320)
+                for window in windows:
+                    all_pairs.append([claim, window])
+                    all_claims.append(claim)
+                    sample_indices.append(idx)
+                    chunk_ids.append(chunk["id"])
+                    window_texts.append(window)
+
+    if not all_pairs:
+        return {}
+
+    rerank_best: Dict[Tuple, Dict] = {}
+
+    for i in tqdm(range(0, len(all_pairs), batch_size), desc="Reranker inference"):
+        batch_pairs = all_pairs[i : i + batch_size]
+        inputs = tokenizer(batch_pairs, padding=True, truncation=True, return_tensors="pt", max_length=512).to(device)
+        
+        with torch.no_grad():
+            probs = torch.sigmoid(reranker_model(**inputs).logits.view(-1).float()).cpu().numpy()
+
+        for j, score_val in enumerate(probs):
+            global_idx = i + j
+            key = (sample_indices[global_idx], all_claims[global_idx])
+            
+            # Stratégie Max Pooling[cite: 1]
+            prev = rerank_best.get(key, {"rerank_score": -1.0})
+            if score_val > prev["rerank_score"]:
+                rerank_best[key] = {
+                    "rerank_score": float(np.round(score_val, 4)),
+                    "best_chunk_id": chunk_ids[global_idx],
+                    "best_chunk_text": window_texts[global_idx],
+                }
+
+    return rerank_best
+
+
+
+
+
+# =========================================================
+# 1. SCORING CLAIM-LEVEL — NLI (Avec Fenêtrage)
+# =========================================================
+
+def get_claim_level_nli_scores(
+    df: pd.DataFrame, nli_model, batch_size: int = 64, 
+    claims_col: str = "atomic_claims", chunks_col: str = "retrieved_chunks"
+) -> Dict[Tuple, Dict]:
+    
+    all_pairs, all_claims, sample_indices, chunk_ids, window_texts = [], [], [], [], []
+
+    for idx, row in df.iterrows():
+        claims = parse_atomic_claims(row[claims_col])
+        chunks = row.get(chunks_col, []) if isinstance(row, dict) else row[chunks_col]
+        if not claims or not chunks:
+            continue
+            
+        for claim in claims:
+            for chunk in chunks:
+                # Application du fenêtrage sur le chunk
+                windows = get_windows(chunk["text"], window_size=320, stride=320)
+                for window in windows:
+                    all_pairs.append({"text": window, "text_pair": claim})
+                    all_claims.append(claim)
+                    sample_indices.append(idx)
+                    chunk_ids.append(chunk["id"])
+                    window_texts.append(window)
+
+    if not all_pairs:
+        return {}
+
+    nli_best: Dict[Tuple, Dict] = {}
+
+    for i in tqdm(range(0, len(all_pairs), batch_size), desc="NLI inference"):
+        batch = all_pairs[i : i + batch_size]
+        results = nli_model(batch, top_k=None, batch_size=batch_size)
+
+        for j, pair_results in enumerate(results):
+            entail, contradict, neutral = 0.0, 0.0, 0.0
+            items = pair_results if isinstance(pair_results, list) else [pair_results]
+            for item in items:
+                lbl = str(item.get("label", "")).upper()
+                score = item.get("score", 0.0)
+                if "ENTAIL" in lbl: entail = score
+                elif "CONTRADICT" in lbl: contradict = score
+                elif "NEUTRAL" in lbl: neutral = score
+
+            global_idx = i + j
+            key = (sample_indices[global_idx], all_claims[global_idx])
+            
+            # Calcul des features lexicales sur la fenêtre courante
+            lex_feats = compute_lexical_features(all_claims[global_idx], window_texts[global_idx])
+            
+            # Stratégie Max Pooling[cite: 1]
+            prev = nli_best.get(key, {"entail": -1.0})
+            if entail > prev.get("entail", -1.0):
+                nli_best[key] = {
+                    "entail": entail,
+                    "contradict": contradict,
+                    "neutral": neutral,
+                    "best_chunk_id": chunk_ids[global_idx],
+                    "best_chunk_text": window_texts[global_idx],
+                    **lex_feats # On stocke les features lexicales de la meilleure fenêtre
+                }
+
+    return nli_best
+
+
+# =========================================================
+# 2. SCORING CLAIM-LEVEL — RERANKER (Avec Fenêtrage)
+# =========================================================
+
+def get_claim_level_reranker_scores(
+    df: pd.DataFrame, reranker_model, tokenizer, batch_size: int = 128,
+    claims_col: str = "atomic_claims", chunks_col: str = "retrieved_chunks", device: str = "cuda"
+) -> Dict[Tuple, Dict]:
+    
+    all_pairs, all_claims, sample_indices, chunk_ids, window_texts = [], [], [], [], []
+
+    for idx, row in df.iterrows():
+        claims = parse_atomic_claims(row[claims_col])
+        chunks = row.get(chunks_col, []) if isinstance(row, dict) else row[chunks_col]
+        if not claims or not chunks:
+            continue
+            
+        for claim in claims:
+            for chunk in chunks:
+                windows = get_windows(chunk["text"], window_size=320, stride=320)
+                for window in windows:
+                    all_pairs.append([claim, window])
+                    all_claims.append(claim)
+                    sample_indices.append(idx)
+                    chunk_ids.append(chunk["id"])
+                    window_texts.append(window)
+
+    if not all_pairs:
+        return {}
+
+    rerank_best: Dict[Tuple, Dict] = {}
+
+    for i in tqdm(range(0, len(all_pairs), batch_size), desc="Reranker inference"):
+        batch_pairs = all_pairs[i : i + batch_size]
+        inputs = tokenizer(batch_pairs, padding=True, truncation=True, return_tensors="pt", max_length=512).to(device)
+        
+        with torch.no_grad():
+            probs = torch.sigmoid(reranker_model(**inputs).logits.view(-1).float()).cpu().numpy()
+
+        for j, score_val in enumerate(probs):
+            global_idx = i + j
+            key = (sample_indices[global_idx], all_claims[global_idx])
+            
+            # Stratégie Max Pooling[cite: 1]
+            prev = rerank_best.get(key, {"rerank_score": -1.0})
+            if score_val > prev["rerank_score"]:
+                rerank_best[key] = {
+                    "rerank_score": float(np.round(score_val, 4)),
+                    "best_chunk_id": chunk_ids[global_idx],
+                    "best_chunk_text": window_texts[global_idx],
+                }
+
+    return rerank_best
+
+
+
+
+
+# =========================================================
+# 3. CONSTRUCTEUR DE TABLE DE FEATURES
+# =========================================================
+
+def build_feature_table(nli_scores: Dict[Tuple, Dict], rerank_scores: Dict[Tuple, Dict]) -> pd.DataFrame:
+    rows = []
+    for key, nli_s in nli_scores.items():
+        rerank_s = rerank_scores.get(key, {"rerank_score": 0.0, "best_chunk_id": None, "best_chunk_text": ""})
+        
+        rows.append({
+            "row_idx": key[0],
+            "claim": key[1],
+            "nli_entail": nli_s["entail"],
+            "nli_contradict": nli_s["contradict"],
+            "nli_neutral": nli_s.get("neutral", 0.0),
+            "rerank_score": rerank_s["rerank_score"],
+            
+            # Nouvelles features lexicales[cite: 1]
+            "len_claim": nli_s.get("len_claim", 0),
+            "len_chunk": nli_s.get("len_chunk", 0),
+            "length_ratio": nli_s.get("length_ratio", 0.0),
+            "jaccard_sim": nli_s.get("jaccard_sim", 0.0),
+            "rouge_l": nli_s.get("rouge_l", 0.0),
+            
+            "nli_best_chunk_text": nli_s.get("best_chunk_text", ""),
+            "rerank_best_chunk_text": rerank_s.get("best_chunk_text", ""),
+        })
+    return pd.DataFrame(rows)
+
+# =========================================================
+# 4. JUDGE LLM — PROMPTS & LABELLISATION
+# =========================================================
+# Le code reste identique à ton implémentation originelle.
+JUDGE_SYSTEM_PROMPT = """**Role:**...""" # (Tronqué pour la lisibilité, garde ton prompt original)
+
+def build_judge_user_prompt(claim: str, chunks_text: str) -> str:
+    return f"**CONTEXT CHUNKS:**\n{chunks_text}\n\n**CLAIM TO VERIFY:**\n{claim}\n\n**Verdict (single word):**"
+
+def generate_qwen(system_prompt: str, user_prompt: str) -> str:
+    raise NotImplementedError("Remplace cette fonction par ton appel API Qwen.")
+
+def build_calibration_dataset(feature_table: pd.DataFrame, n_samples: Optional[int] = None, random_state: int = 42) -> pd.DataFrame:
+    # Ton code d'origine pour appeler Qwen et extraire les labels 1/0
+    table = feature_table.copy()
+    if n_samples is not None:
+        table = table.sample(n=min(n_samples, len(table)), random_state=random_state).reset_index(drop=True)
+
+    labels = []
+    for _, row in tqdm(table.iterrows(), total=len(table), desc="Labellisation via Qwen"):
+        best_chunks = list(set([row["nli_best_chunk_text"], row["rerank_best_chunk_text"]]))
+        context_for_judge = "\n\n--- NEXT CHUNK ---\n\n".join(best_chunks)
+        user_prompt = build_judge_user_prompt(row["claim"], context_for_judge)
+        
+        # raw_output = generate_qwen(system_prompt=JUDGE_SYSTEM_PROMPT, user_prompt=user_prompt)
+        raw_output = "SUPPORTED" # MOCK POUR TESTER
+        
+        is_supported = "SUPPORTED" in str(raw_output).strip().upper()
+        labels.append(1 if is_supported else 0)
+
+    table["label"] = labels
+    return table
+
+
+
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import precision_recall_curve, f1_score, classification_report
+
+# Mise à jour des colonnes pour inclure les features lexicales
+FEATURE_COLS = [
+    "nli_entail", "nli_contradict", "nli_neutral", "rerank_score",
+    "len_claim", "len_chunk", "length_ratio", "jaccard_sim", "rouge_l"
+]
+
+# =========================================================
+# 5. ENTRAINEMENT, CALIBRATION ET ABSTENTION
+# =========================================================
+
+def train_calibrated_meta_classifier(
+    calibration_df: pd.DataFrame, feature_cols: List[str] = FEATURE_COLS, cv_folds: int = 5
+):
+    X = calibration_df[feature_cols].values
+    y = calibration_df["label"].values
+    groups = calibration_df["row_idx"].values
+
+    # Classifieur de base avec poids équilibrés[cite: 1]
+    base_clf = LogisticRegression(class_weight="balanced", max_iter=1000)
+    
+    # Protocole d'entraînement out-of-fold (OOF) à 5 plis avec Isotonic Regression[cite: 1]
+    gkf = GroupKFold(n_splits=cv_folds)
+    calibrated_clf = CalibratedClassifierCV(
+        estimator=base_clf, 
+        method="isotonic",
+        cv=gkf
+    )
+    
+    # L'entraînement ajuste la calibration post-hoc sur les prédictions OOF
+    calibrated_clf.fit(X, y, groups=groups)
+    
+    # Génération des probabilités calibrées sur les données d'entraînement 
+    # (En production, ceci est fait sur un set de validation OOF)
+    y_probs = calibrated_clf.predict_proba(X)[:, 1]
+    
+    return calibrated_clf, y_probs, y
+
+def optimize_threshold(y_true, y_probs, min_precision=0.70):
+    """
+    Trouve le seuil qui maximise le score F1 sous la contrainte Precision >= 0.70[cite: 1].
+    """
+    precisions, recalls, thresholds = precision_recall_curve(y_true, y_probs)
+    best_f1, optimal_threshold = 0, 0.5
+    
+    for p, r, t in zip(precisions, recalls, thresholds):
+        if p >= min_precision:
+            f1 = 2 * (p * r) / (p + r) if (p + r) > 0 else 0
+            if f1 > best_f1:
+                best_f1 = f1
+                optimal_threshold = t
+                
+    return optimal_threshold
+
+def apply_abstention_policy(y_probs, threshold, margin=0.10):
+    """
+    Implémente un mécanisme de rejet (abstention) autour du seuil d'incertitude[cite: 1].
+    Retourne -1 pour les cas où le modèle choisit de s'abstenir.
+    """
+    predictions = []
+    for p in y_probs:
+        if (threshold - margin) < p < (threshold + margin):
+            predictions.append(-1) # Abstention
+        else:
+            predictions.append(1 if p >= threshold else 0)
+    return np.array(predictions)
+
+
+
+
+
+# =========================================================
+# APPELS D'EXECUTION (MAIN)
+# =========================================================
+
+if __name__ == "__main__":
+    import pickle
+    import pandas as pd
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+    
+    # --- 1. Chargement des Modèles ---
+    print("Chargement des modèles de scoring...")
+    # À DÉCOMMENTER EN PROD
+    # nli_model = pipeline("text-classification", model="MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7", device=0)
+    # reranker_tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-reranker-v2-m3")
+    # reranker_model = AutoModelForSequenceClassification.from_pretrained("BAAI/bge-reranker-v2-m3").to("cuda").eval()
+
+    # --- 2. Chargement du dataset ---
+    print("Chargement du dataset d'entraînement...")
+    # train_df = pd.read_parquet("train_200.parquet")
+    
+    # MOCK DATA POUR TESTER LE SCRIPT SANS PLANTER
+    train_df = pd.DataFrame({
+        "atomic_claims": [["Le ciel est bleu", "L'eau bout à 100 degrés"]],
+        "retrieved_chunks": [[{"id": "doc1", "text": "Le ciel est bien bleu aujourd'hui. L'eau bout à 100°C au niveau de la mer."}]]
+    })
+
+    # --- 3. Scoring (NLI + Reranker avec Fenêtrage) ---
+    print("Étape 1 : Calcul des scores NLI (sur fenêtres de 320 tokens)...")
+    # nli_scores_train = get_claim_level_nli_scores(train_df, nli_model)
+    nli_scores_train = {} # MOCK
+    
+    print("Étape 2 : Calcul des scores Reranker (sur fenêtres de 320 tokens)...")
+    # rerank_scores_train = get_claim_level_reranker_scores(train_df, reranker_model, reranker_tokenizer)
+    rerank_scores_train = {} # MOCK
+    
+    print("Étape 3 : Création de la table de features (incluant lexicales)...")
+    feature_table_train = build_feature_table(nli_scores_train, rerank_scores_train)
+
+    # --- 4. Labellisation via Juge LLM ---
+    print("Étape 4 : Labellisation LLM (Qwen)...")
+    calibration_train = build_calibration_dataset(feature_table_train)
+
+    if len(calibration_train) > 0:
+        # --- 5. Entraînement et Calibration ---
+        print("Étape 5 : Entraînement OOF et Calibration (Isotonic)...")
+        calibrated_clf, y_probs, y_true = train_calibrated_meta_classifier(
+            calibration_df=calibration_train, 
+            feature_cols=FEATURE_COLS, 
+            cv_folds=5  # Minimum 5 pour le papier HALT-RAG
+        )
+        
+        # --- 6. Optimisation du Seuil et Abstention ---
+        print("Étape 6 : Optimisation du seuil de décision...")
+        optimal_threshold = optimize_threshold(y_true, y_probs, min_precision=0.70)
+        print(f"Seuil optimal trouvé (Precision >= 0.70) : {optimal_threshold:.3f}")
+        
+        print("Application de la politique d'abstention...")
+        # Applique une marge d'incertitude autour du seuil optimal
+        final_predictions = apply_abstention_policy(y_probs, optimal_threshold, margin=0.05)
+        
+        n_abstained = (final_predictions == -1).sum()
+        print(f"Le modèle s'est abstenu sur {n_abstained} / {len(final_predictions)} prédictions.")
+
+        # --- 7. Sauvegarde ---
+        save_path = "halt_rag_calibrated_classifier.pkl"
+        with open(save_path, "wb") as f:
+            pickle.dump({
+                "model": calibrated_clf, 
+                "feature_cols": FEATURE_COLS,
+                "optimal_threshold": optimal_threshold
+            }, f)
+        print(f"Classifieur et métadonnées sauvegardés -> {save_path}")
+    else:
+        print("Pas assez de données pour entraîner le classifieur (Mock Data vide).")
+
+    print("Pipeline d'entraînement terminé avec succès.")
