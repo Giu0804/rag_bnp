@@ -356,3 +356,148 @@ def plot_strict_heatmap(df, lambda_val=0.8, gamma=0.85, stat_mode="mean", gt_col
     plt.xlabel("Prédiction (Après CiteFix)")
     plt.tight_layout()
     plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+VERSION CORRIGEE J ESPERE
+
+import pandas as pd
+import numpy as np
+import ast
+import re
+import stopwords
+
+# 1. INITIALISATION DES STOPWORDS
+BILINGUAL_STOPWORDS = set(stopwords.get_stopwords('french')).union(set(stopwords.get_stopwords('english')))
+
+def clean_text_words(text):
+    words = re.findall(r"\b\w+\b", str(text).lower())
+    return set(w for w in words if w not in BILINGUAL_STOPWORDS)
+
+def compute_lexical_score_asymmetric(snip_tokens, doc_tokens):
+    if not snip_tokens: return 0.0
+    return len(snip_tokens.intersection(doc_tokens)) / len(snip_tokens)
+
+# ==========================================================
+# FONCTION CITEFIX (Génère la colonne inline_processed_citefix)
+# ==========================================================
+def apply_citefix(df, lambda_val=0.8, stat_mode="mean", gamma=0.85, pred_col="inline_processed"):
+    df_out = df.copy()
+    new_column = []
+
+    for idx, row in df_out.iterrows():
+        # --- 1. PRÉPARATION DU CONTEXTE (comme ton compute_scores_for_sample) ---
+        contexts = row.get("contexts", [])
+        if isinstance(contexts, np.ndarray):
+            contexts = contexts.tolist()
+            
+        doc_cache = {}
+        for ctx in (contexts if isinstance(contexts, list) else []):
+            if isinstance(ctx, dict) and "id" in ctx:
+                d_id = int(ctx["id"])
+                # Récupère le score comme dans ton code original
+                r_score = float(ctx.get("score", ctx.get("rerank_score", 0.0)))
+                doc_cache[d_id] = {
+                    "tokens": clean_text_words(ctx.get("text", "")),
+                    "r_score": r_score
+                }
+
+        enriched_snippets = []
+        
+        # --- 2. PARSING SÉCURISÉ DES PREDICTIONS (Pour éviter les []) ---
+        raw_preds = row.get(pred_col, [])
+        if isinstance(raw_preds, str):
+            try: raw_preds = ast.literal_eval(raw_preds)
+            except: raw_preds = []
+        if isinstance(raw_preds, np.ndarray):
+            raw_preds = raw_preds.tolist()
+        if not isinstance(raw_preds, list):
+            raw_preds = []
+
+        # --- 3. TRAITEMENT DE CHAQUE SNIPPET ---
+        for item in raw_preds:
+            if not isinstance(item, dict): 
+                continue
+            
+            # Gestion robuste du snippet_id
+            sid_val = item.get("snippet_id", item.get("id"))
+            if sid_val is None: 
+                continue
+            sid = int(sid_val)
+            
+            snip_tokens = clean_text_words(item.get("text", ""))
+
+            # Récupération des citations initiales
+            raw_cits = item.get("citations", item.get("citation", item.get("prediction", [])))
+            if isinstance(raw_cits, np.ndarray): 
+                base_cits = set(raw_cits.tolist())
+            elif isinstance(raw_cits, (list, set)): 
+                base_cits = set(raw_cits)
+            elif isinstance(raw_cits, str):
+                base_cits = set(int(s) for s in re.findall(r'\d+', raw_cits))
+            elif isinstance(raw_cits, (int, float)) and not np.isnan(raw_cits):
+                base_cits = {int(raw_cits)}
+            else: 
+                base_cits = set()
+
+            # On ne garde que les entiers propres
+            new_cits = set(int(c) for c in base_cits if str(c).isdigit() or isinstance(c, (int, np.integer)))
+
+            # --- 4. CALCUL CITEFIX & SEUIL ADAPTATIF (sans fallback) ---
+            if len(new_cits) > 0:
+                scores_for_snip = {}
+                
+                # Calcul de ton équation hybride S_ij pour tous les docs du contexte
+                for d_id, doc_data in doc_cache.items():
+                    f_lex = compute_lexical_score_asymmetric(snip_tokens, doc_data["tokens"])
+                    # EXACTEMENT ton équation :
+                    scores_for_snip[d_id] = (lambda_val * f_lex) + ((1.0 - lambda_val) * doc_data["r_score"])
+
+                # Récupération des scores des citations initiales
+                initial_scores = [scores_for_snip.get(c, 0.0) for c in new_cits if c in scores_for_snip]
+                if not initial_scores: 
+                    initial_scores = [0.0]
+
+                # Choix de la statistique
+                if stat_mode == "mean": ref_stat = float(np.mean(initial_scores))
+                elif stat_mode == "max": ref_stat = float(np.max(initial_scores))
+                elif stat_mode == "min": ref_stat = float(np.min(initial_scores))
+                else: ref_stat = float(np.mean(initial_scores))
+                
+                # Seuil
+                adaptive_tau = gamma * ref_stat
+
+                # Ajout des nouvelles citations qui dépassent le seuil
+                for d_id, score in scores_for_snip.items():
+                    if score >= adaptive_tau:
+                        new_cits.add(d_id)
+            
+            # Si len(new_cits) == 0, on n'a rien ajouté (pas de fallback), on garde set() vide.
+
+            # --- 5. RECONSTRUCTION DU FORMAT FINAL ---
+            enriched_snippets.append({
+                "snippet_id": sid,
+                "text": item.get("text", ""),
+                "citations": np.array(sorted(list(new_cits)), dtype=int) # Remis en format numpy array comme tu l'avais
+            })
+            
+        new_column.append(enriched_snippets)
+
+    # 6. Ajout de la colonne et renvoi du dataset
+    df_out["inline_processed_citefix"] = new_column
+    return df_out
