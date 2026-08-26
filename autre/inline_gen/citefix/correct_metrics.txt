@@ -121,3 +121,327 @@ def evaluate_chunk_classification_metrics(df, gt_col='preannotation', pred_col='
         "mean_precision": (sum_snippet_precision / total_snippets) * 100,
         "mean_f1": (sum_snippet_f1 / total_snippets) * 100
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def plot_heatmap_for_lambda(df, target_lambda, gt_col='preannotation', stat_mode="mean", gamma=0.85):
+    """
+    Calcule les prédictions pour un lambda donné et affiche la Heatmap 2x2
+    complète (TP, FP, FN, TN) au niveau des chunks par snippet.
+    """
+    # 1. Calcul des nouvelles prédictions avec le lambda cible
+    temp_col = []
+    for _, row in df.iterrows():
+        scores = compute_scores_for_sample(row, lambda_val=target_lambda)
+        enriched = apply_adaptive_validation(row, scores, stat_mode=stat_mode, gamma=gamma)
+        temp_col.append(enriched)
+
+    df_temp = df.copy()
+    df_temp["eval_heatmap_col"] = temp_col
+
+    # 2. Appel de la fonction d'évaluation complète
+    m = evaluate_chunk_classification_metrics(df_temp, gt_col=gt_col, pred_col="eval_heatmap_col")
+
+    tp = m["tp"]
+    fp = m["fp"]
+    fn = m["fn"]
+    tn = m["tn"]
+
+    # Matrice 2x2 réelle
+    matrix_data = np.array([
+        [tp, fn],
+        [fp, tn]
+    ])
+
+    total_decisions = tp + fp + fn + tn
+    
+    # Textes d'annotation avec pourcentages
+    labels = np.array([
+        [f"Vrais Positifs (TP)\n{tp}\n({(tp/total_decisions)*100:.1f}%)", 
+         f"Faux Négatifs (FN)\n{fn}\n({(fn/total_decisions)*100:.1f}%)"],
+        [f"Faux Positifs (FP)\n{fp}\n({(fp/total_decisions)*100:.1f}%)", 
+         f"Vrais Négatifs (TN)\n{tn}\n({(tn/total_decisions)*100:.1f}%)"]
+    ])
+
+    # 3. Tracé Heatmap Seaborn
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(
+        matrix_data,
+        annot=labels,
+        fmt="",
+        cmap="Blues",
+        cbar=True,
+        xticklabels=["Prédit Cité (1)", "Prédit Non-Cité (0)"],
+        yticklabels=["Attendu GT (1)", "Non-Attendu GT (0)"]
+    )
+
+    plt.title(
+        f"Matrice de Confusion par Chunk/Snippet ($\\lambda = {target_lambda}$ | Mode = '{stat_mode}' | $\\gamma = {gamma}$)\n"
+        f"Rappel : {m['mean_recall']:.2f}% | Précision : {m['mean_precision']:.2f}% | F1 : {m['mean_f1']:.2f}%",
+        fontsize=12, pad=14
+    )
+    plt.ylabel("Vérité Terrain (GT)", fontsize=11)
+    plt.xlabel("Prédiction Post-Traitement", fontsize=11)
+    plt.tight_layout()
+    plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def run_lambda_grid_search(
+    df,
+    gt_col="preannotation",
+    stat_mode="mean",
+    lambda_start=0.1,
+    lambda_end=0.9,
+    step=0.05,
+    gamma=0.85,
+):
+  lambdas = np.arange(lambda_start, lambda_end + 1e-5, step)
+  results = []
+
+  print(f"\n{'='*95}")
+  print(
+      f"GRID SEARCH SUR LAMBDA (Mode Stat = '{stat_mode}' | Gamma = {gamma})"
+  )
+  print(f"{'='*95}")
+  print(
+      f"{'Lambda':<8} | {'Rappel %':<10} | {'Précision %':<12} | {'F1 %':<8} |"
+      f" {'Exact %':<9} | {'TP':<6} | {'FP':<6} | {'FN':<6} | {'TN':<6}"
+  )
+  print(f"{'-'*95}")
+
+  for l_val in lambdas:
+    l_val = round(l_val, 3)
+    temp_col = []
+
+    for _, row in df.iterrows():
+      scores = compute_scores_for_sample(row, lambda_val=l_val)
+      enriched = apply_adaptive_validation(
+          row, scores, stat_mode=stat_mode, gamma=gamma
+      )
+      temp_col.append(enriched)
+
+    df_temp = df.copy()
+    df_temp["temp_eval_col"] = temp_col
+
+    # Appel de la nouvelle fonction d'évaluation
+    m = evaluate_chunk_classification_metrics(
+        df_temp, gt_col=gt_col, pred_col="temp_eval_col"
+    )
+    m["lambda"] = l_val
+    results.append(m)
+
+    print(
+        f"{l_val:<8.2f} | {m['mean_recall']:<10.2f} |"
+        f" {m['mean_precision']:<12.2f} | {m['mean_f1']:<8.2f} |"
+        f" {m['chunk_accuracy']*100:<9.2f} | {m['tp']:<6} | {m['fp']:<6} |"
+        f" {m['fn']:<6} | {m['tn']:<6}"
+    )
+
+  print(f"{'='*95}\n")
+  res_df = pd.DataFrame(results)
+
+  # Tracé des courbes
+  plt.figure(figsize=(10, 6))
+  plt.plot(
+      res_df["lambda"],
+      res_df["mean_recall"],
+      marker="o",
+      label="Moyenne Rappel",
+      color="#2ca02c",
+      linewidth=2.5,
+  )
+  plt.plot(
+      res_df["lambda"],
+      res_df["mean_precision"],
+      marker="s",
+      label="Moyenne Précision",
+      color="#1f77b4",
+      linewidth=2,
+  )
+  plt.plot(
+      res_df["lambda"],
+      res_df["mean_f1"],
+      marker="^",
+      label="Moyenne F1",
+      color="#ff7f0e",
+      linestyle="--",
+  )
+  plt.plot(
+      res_df["lambda"],
+      res_df["chunk_accuracy"] * 100,
+      marker="d",
+      label="Chunk Accuracy (TP+TN)",
+      color="#9467bd",
+      linestyle=":",
+  )
+
+  plt.title(
+      f"Évolution des Métriques selon $\\lambda$ (Mode = '{stat_mode}', $\\gamma"
+      f" = {gamma}$)",
+      fontsize=12,
+      pad=12,
+  )
+  plt.xlabel(
+      "Valeur de $\\lambda$ (0.0 = Reranker pur, 1.0 = Lexical pur)",
+      fontsize=11,
+  )
+  plt.ylabel("Score (%)", fontsize=11)
+  plt.grid(True, linestyle="--", alpha=0.6)
+  plt.legend(fontsize=11)
+  plt.tight_layout()
+  plt.show()
+
+  return res_df
+
+
+
+
+
+
+
+
+
+
+def run_gamma_grid_search(
+    df,
+    fixed_lambda=0.8,
+    stat_mode="mean",
+    gt_col="preannotation",
+    gamma_start=0.5,
+    gamma_end=1.2,
+    step=0.05,
+):
+  gammas = np.arange(gamma_start, gamma_end + 1e-5, step)
+  results = []
+
+  print(f"\n{'='*95}")
+  print(
+      f"GRID SEARCH SUR GAMMA (Lambda fixé = {fixed_lambda:.2f} | Stat ="
+      f" '{stat_mode}')"
+  )
+  print(f"{'='*95}")
+  print(
+      f"{'Gamma':<8} | {'Rappel %':<10} | {'Précision %':<12} | {'F1 %':<8} |"
+      f" {'Exact %':<9} | {'TP':<6} | {'FP':<6} | {'FN':<6} | {'TN':<6}"
+  )
+  print(f"{'-'*95}")
+
+  # Pré-calcul des scores pour accélérer l'exécution
+  cached_scores = [
+      compute_scores_for_sample(row, lambda_val=fixed_lambda)
+      for _, row in df.iterrows()
+  ]
+
+  for g_val in gammas:
+    g_val = round(g_val, 3)
+    temp_col = []
+
+    for (_, row), scores in zip(df.iterrows(), cached_scores):
+      enriched = apply_adaptive_validation(
+          row, scores, stat_mode=stat_mode, gamma=g_val
+      )
+      temp_col.append(enriched)
+
+    df_temp = df.copy()
+    df_temp["temp_eval_col"] = temp_col
+
+    m = evaluate_chunk_classification_metrics(
+        df_temp, gt_col=gt_col, pred_col="temp_eval_col"
+    )
+    m["gamma"] = g_val
+    results.append(m)
+
+    print(
+        f"{g_val:<8.2f} | {m['mean_recall']:<10.2f} |"
+        f" {m['mean_precision']:<12.2f} | {m['mean_f1']:<8.2f} |"
+        f" {m['chunk_accuracy']*100:<9.2f} | {m['tp']:<6} | {m['fp']:<6} |"
+        f" {m['fn']:<6} | {m['tn']:<6}"
+    )
+
+  print(f"{'='*95}\n")
+  res_df = pd.DataFrame(results)
+
+  # Tracé des courbes
+  plt.figure(figsize=(10, 6))
+  plt.plot(
+      res_df["gamma"],
+      res_df["mean_recall"],
+      marker="o",
+      label="Moyenne Rappel",
+      color="#2ca02c",
+      linewidth=2.5,
+  )
+  plt.plot(
+      res_df["gamma"],
+      res_df["mean_precision"],
+      marker="s",
+      label="Moyenne Précision",
+      color="#1f77b4",
+      linewidth=2,
+  )
+  plt.plot(
+      res_df["gamma"],
+      res_df["mean_f1"],
+      marker="^",
+      label="Moyenne F1",
+      color="#ff7f0e",
+      linestyle="--",
+  )
+  plt.plot(
+      res_df["gamma"],
+      res_df["chunk_accuracy"] * 100,
+      marker="d",
+      label="Chunk Accuracy (TP+TN)",
+      color="#9467bd",
+      linestyle=":",
+  )
+
+  plt.title(
+      "Évolution des Métriques selon $\\gamma$ (Tolérance |"
+      f" $\\lambda={fixed_lambda}$ | Mode='{stat_mode}')",
+      fontsize=12,
+      pad=12,
+  )
+  plt.xlabel("Valeur de $\\gamma$", fontsize=11)
+  plt.ylabel("Score (%)", fontsize=11)
+  plt.grid(True, linestyle="--", alpha=0.6)
+  plt.legend(fontsize=11)
+  plt.tight_layout()
+  plt.show()
+
+  return res_df
