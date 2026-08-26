@@ -281,38 +281,44 @@ def run_lambda_grid_search_clean(df, gt_col="preannotation", pred_col="inline_pr
 
 
 
+def run_gamma_grid_search_clean(df, gt_col="preannotation", pred_col="inline_processed", fixed_lambda=0.8, stat_mode="mean"):
+    gammas = np.arange(0.5, 1.25, 0.05)
+    results = []
 
+    print(f"\n{'='*85}")
+    print(f"GRID SEARCH GAMMA (Lambda = {fixed_lambda} | Stat = '{stat_mode}')")
+    print(f"{'='*85}")
+    print(f"{'Gamma':<8} | {'Rappel %':<10} | {'Précision %':<12} | {'F1 %':<8} | {'TP':<6} | {'FP':<6} | {'FN':<6} | {'TN':<6}")
+    print(f"{'-'*85}")
 
-def plot_strict_heatmap(df, lambda_val=0.8, gamma=0.85, stat_mode="mean", gt_col="preannotation", pred_col="inline_processed"):
-    
-    # 1. Génération du dataframe enrichi
-    df_enriched = apply_citefix(df, lambda_val=lambda_val, stat_mode=stat_mode, gamma=gamma, pred_col=pred_col)
-    
-    # 2. Évaluation silencieuse pour récupérer les compteurs
-    m = evaluate_metrics(df_enriched, gt_col=gt_col, pred_col="inline_processed_citefix", verbose=False)
-    
-    # 3. Préparation de la matrice
-    matrix = np.array([[m["tp"], m["fn"]], [m["fp"], m["tn"]]])
-    total = m["tp"] + m["fp"] + m["fn"] + m["tn"]
-    
-    # Textes avec pourcentages
-    labels = np.array([
-        [f"Vrais Positifs (TP)\n{m['tp']}\n({(m['tp']/total)*100:.1f}%)", f"Faux Négatifs (FN)\n{m['fn']}\n({(m['fn']/total)*100:.1f}%)"],
-        [f"Faux Positifs (FP)\n{m['fp']}\n({(m['fp']/total)*100:.1f}%)", f"Vrais Négatifs (TN)\n{m['tn']}\n({(m['tn']/total)*100:.1f}%)"]
-    ])
-    
-    # 4. Tracé
-    plt.figure(figsize=(7, 5))
-    sns.heatmap(matrix, annot=labels, fmt="", cmap="Blues", cbar=False,
-                xticklabels=["Prédit Cité (1)", "Prédit Non-Cité (0)"],
-                yticklabels=["Attendu GT (1)", "Non-Attendu GT (0)"])
-    plt.title(f"Matrice de Confusion des Chunks\n(Lambda={lambda_val} | Gamma={gamma} | Mode={stat_mode})")
-    plt.ylabel("Vérité Terrain (Ground Truth)")
-    plt.xlabel("Prédiction (Après CiteFix)")
+    for g_val in gammas:
+        g_val = round(g_val, 2)
+        
+        # 1. Applique CiteFix
+        df_temp = apply_citefix(df, lambda_val=fixed_lambda, stat_mode=stat_mode, gamma=g_val, pred_col=pred_col)
+        
+        # 2. Évalue
+        m = evaluate_metrics(df_temp, gt_col=gt_col, pred_col="inline_processed_citefix", verbose=False)
+        m["gamma"] = g_val
+        results.append(m)
+
+        print(f"{g_val:<8.2f} | {m['mean_recall']:<10.2f} | {m['mean_precision']:<12.2f} | {m['mean_f1']:<8.2f} | {m['tp']:<6} | {m['fp']:<6} | {m['fn']:<6} | {m['tn']:<6}")
+
+    res_df = pd.DataFrame(results)
+
+    plt.figure(figsize=(9, 5))
+    plt.plot(res_df["gamma"], res_df["mean_recall"], marker="o", label="Recall", color="green")
+    plt.plot(res_df["gamma"], res_df["mean_precision"], marker="s", label="Precision", color="blue")
+    plt.plot(res_df["gamma"], res_df["mean_f1"], marker="^", label="F1 Score", color="orange")
+    plt.title(f"Évolution selon $\\gamma$ (Lambda={fixed_lambda}, Mode={stat_mode})")
+    plt.xlabel("Valeur de $\\gamma$ (Plus c'est bas, plus on force le rappel)")
+    plt.ylabel("Score (%)")
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.legend()
     plt.tight_layout()
     plt.show()
 
-
+    return res_df
 
 
 
