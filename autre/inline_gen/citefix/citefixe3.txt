@@ -1,0 +1,352 @@
+import pandas as pd
+import numpy as np
+import ast
+import re
+import stopwords
+
+# 1. INITIALISATION DES STOPWORDS
+BILINGUAL_STOPWORDS = set(stopwords.get_stopwords('french')).union(set(stopwords.get_stopwords('english')))
+
+def clean_text_words(text):
+    words = re.findall(r"\b\w+\b", str(text).lower())
+    return set(w for w in words if w not in BILINGUAL_STOPWORDS)
+
+def compute_lexical_score_asymmetric(snip_tokens, doc_tokens):
+    if not snip_tokens: return 0.0
+    return len(snip_tokens.intersection(doc_tokens)) / len(snip_tokens)
+
+# 2. FONCTION PRINCIPALE SANS FALLBACK
+def apply_citefix(df, lambda_val=0.8, stat_mode="mean", gamma=0.85, pred_col="inline_processed"):
+    """
+    Applique la règle adaptative UNIQUEMENT si le modèle a déjà produit au moins une citation.
+    S'il n'y a pas de citation de base, on n'ajoute rien (pas de fallback).
+    """
+    df_out = df.copy()
+    new_column = []
+
+    for idx, row in df_out.iterrows():
+        # A. Préparation du contexte
+        contexts = row.get("contexts", [])
+        doc_cache = {}
+        for ctx in contexts:
+            if "id" in ctx:
+                d_id = int(ctx["id"])
+                doc_cache[d_id] = {
+                    "tokens": clean_text_words(ctx.get("text", "")),
+                    "r_score": float(ctx.get("score", 0.0))
+                }
+
+        enriched_snippets = []
+        raw_preds = row.get(pred_col, [])
+        if isinstance(raw_preds, str):
+            try: raw_preds = ast.literal_eval(raw_preds)
+            except: raw_preds = []
+
+        # B. Traitement de chaque snippet
+        for item in (raw_preds if isinstance(raw_preds, list) else []):
+            if not isinstance(item, dict) or "snippet_id" not in item: continue
+            
+            sid = int(item["snippet_id"])
+            snip_tokens = clean_text_words(item.get("text", ""))
+
+            # Extraction des citations initiales
+            raw_cits = item.get("citations", item.get("citation", item.get("prediction", [])))
+            if isinstance(raw_cits, np.ndarray): base_cits = set(raw_cits.tolist())
+            elif isinstance(raw_cits, (list, set)): base_cits = set(raw_cits)
+            elif isinstance(raw_cits, (int, str)): 
+                try: base_cits = {int(raw_cits)}
+                except: base_cits = set()
+            else: base_cits = set()
+
+            # Nettoyage de base_cits (pour être sûr d'avoir des entiers)
+            new_cits = set(int(c) for c in base_cits if str(c).isdigit() or isinstance(c, int))
+
+            # C. Règle adaptative SANS FALLBACK
+            if len(new_cits) > 0:
+                # Calcul des scores CiteFix pour tous les documents
+                scores_for_snip = {}
+                for d_id, doc_data in doc_cache.items():
+                    f_lex = compute_lexical_score_asymmetric(snip_tokens, doc_data["tokens"])
+                    scores_for_snip[d_id] = (lambda_val * f_lex) + ((1.0 - lambda_val) * doc_data["r_score"])
+
+                # Calcul de la stat de référence
+                initial_scores = [scores_for_snip.get(c, 0.0) for c in new_cits if c in scores_for_snip]
+                if not initial_scores: initial_scores = [0.0]
+
+                if stat_mode == "mean": ref_stat = float(np.mean(initial_scores))
+                elif stat_mode == "max": ref_stat = float(np.max(initial_scores))
+                elif stat_mode == "min": ref_stat = float(np.min(initial_scores))
+                else: ref_stat = float(np.mean(initial_scores))
+                
+                adaptive_tau = gamma * ref_stat
+
+                # Enrichissement
+                for d_id, score in scores_for_snip.items():
+                    if score >= adaptive_tau:
+                        new_cits.add(d_id)
+            
+            # (Si len(new_cits) == 0, on passe tout droit et on garde le set vide)
+
+            enriched_snippets.append({
+                "snippet_id": sid,
+                "text": item.get("text", ""),
+                "citations": sorted(list(new_cits))
+            })
+            
+        new_column.append(enriched_snippets)
+
+    # Ajout au dataset
+    df_out["inline_processed_citefix"] = new_column
+    return df_out
+
+
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import ast
+import re
+
+def extract_clean_ids(val):
+    """Garantit qu'on ressort toujours un set d'entiers Python natifs."""
+    if not val: return set()
+    if isinstance(val, (int, np.integer)): return {int(val)}
+    if isinstance(val, str):
+        digits = [int(s) for s in re.findall(r'\d+', val)]
+        return set(digits)
+    if isinstance(val, (list, np.ndarray, set)):
+        return set(int(x) for x in val if str(x).isdigit() or isinstance(x, (int, np.integer)))
+    return set()
+
+def evaluate_metrics(df, gt_col='preannotation', pred_col='inline_processed_citefix', verbose=True):
+    total_snippets = 0
+    total_chunks_evaluated = 0
+    
+    total_tp, total_fp, total_fn, total_tn = 0, 0, 0, 0
+    sum_recall, sum_precision, sum_f1 = 0.0, 0.0, 0.0
+
+    for idx, row in df.iterrows():
+        # Restriction stricte au contexte de la ligne
+        context_ids = set(int(ctx["id"]) for ctx in row.get("contexts", []) if "id" in ctx)
+        num_docs = len(context_ids)
+
+        # Parsing Ground Truth
+        gt_raw = row.get(gt_col, [])
+        if isinstance(gt_raw, str):
+            try: gt_raw = ast.literal_eval(gt_raw)
+            except: gt_raw = []
+            
+        gt_map = {}
+        for s in (gt_raw if isinstance(gt_raw, list) else []):
+            if isinstance(s, dict) and 'snippet_id' in s:
+                cits = s.get('prediction', s.get('citations', []))
+                gt_map[int(s['snippet_id'])] = extract_clean_ids(cits).intersection(context_ids)
+
+        # Parsing Prédiction
+        pred_raw = row.get(pred_col, [])
+        if isinstance(pred_raw, str):
+            try: pred_raw = ast.literal_eval(pred_raw)
+            except: pred_raw = []
+            
+        pred_map = {}
+        for s in (pred_raw if isinstance(pred_raw, list) else []):
+            if isinstance(s, dict) and 'snippet_id' in s:
+                cits = s.get('citations', s.get('prediction', []))
+                pred_map[int(s['snippet_id'])] = extract_clean_ids(cits).intersection(context_ids)
+
+        # Calcul des métriques
+        all_sids = set(gt_map.keys()) | set(pred_map.keys())
+        
+        for sid in all_sids:
+            total_snippets += 1
+            total_chunks_evaluated += num_docs
+
+            gt_set = gt_map.get(sid, set())
+            pred_set = pred_map.get(sid, set())
+
+            tp = len(gt_set & pred_set)
+            fp = len(pred_set - gt_set)
+            fn = len(gt_set - pred_set)
+            tn = len(context_ids - (gt_set | pred_set))
+
+            total_tp += tp
+            total_fp += fp
+            total_fn += fn
+            total_tn += tn
+
+            if len(gt_set) == 0 and len(pred_set) == 0:
+                r, p, f1 = 1.0, 1.0, 1.0
+            else:
+                p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1 = (2 * p * r) / (p + r) if (p + r) > 0 else 0.0
+
+            sum_recall += r
+            sum_precision += p
+            sum_f1 += f1
+
+    metrics = {
+        "tp": total_tp, "fp": total_fp, "fn": total_fn, "tn": total_tn,
+        "mean_recall": (sum_recall / total_snippets * 100) if total_snippets else 0,
+        "mean_precision": (sum_precision / total_snippets * 100) if total_snippets else 0,
+        "mean_f1": (sum_f1 / total_snippets * 100) if total_snippets else 0,
+        "chunk_accuracy": ((total_tp + total_tn) / total_chunks_evaluated * 100) if total_chunks_evaluated else 0
+    }
+
+    if verbose:
+        print("\n" + "="*60)
+        print("📊 ÉVALUATION RIGOUREUSE")
+        print("="*60)
+        print(f"Total Snippets évalués : {total_snippets}")
+        print(f"Rappel Moyen    : {metrics['mean_recall']:.2f}%")
+        print(f"Précision Moy   : {metrics['mean_precision']:.2f}%")
+        print(f"F1 Score Moy    : {metrics['mean_f1']:.2f}%")
+        print("-" * 60)
+        print(f"Matrice de Confusion Chunks (Total: {total_chunks_evaluated})")
+        print(f"TP: {total_tp:<6} | FP: {total_fp:<6}")
+        print(f"FN: {total_fn:<6} | TN: {total_tn:<6}")
+        print("="*60)
+
+    return metrics
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def run_lambda_grid_search_clean(df, gt_col="preannotation", pred_col="inline_processed", stat_mode="mean", gamma=0.85):
+    lambdas = np.arange(0.1, 1.0, 0.1)
+    results = []
+
+    print(f"\n{'='*85}")
+    print(f"GRID SEARCH LAMBDA (Gamma = {gamma} | Stat = '{stat_mode}')")
+    print(f"{'='*85}")
+    print(f"{'Lambda':<8} | {'Rappel %':<10} | {'Précision %':<12} | {'F1 %':<8} | {'TP':<6} | {'FP':<6} | {'FN':<6} | {'TN':<6}")
+    print(f"{'-'*85}")
+
+    for l_val in lambdas:
+        l_val = round(l_val, 2)
+        
+        # 1. Applique CiteFix (Génère le dataset enrichi)
+        df_temp = apply_citefix(df, lambda_val=l_val, stat_mode=stat_mode, gamma=gamma, pred_col=pred_col)
+        
+        # 2. Évalue
+        m = evaluate_metrics(df_temp, gt_col=gt_col, pred_col="inline_processed_citefix", verbose=False)
+        m["lambda"] = l_val
+        results.append(m)
+
+        print(f"{l_val:<8.2f} | {m['mean_recall']:<10.2f} | {m['mean_precision']:<12.2f} | {m['mean_f1']:<8.2f} | {m['tp']:<6} | {m['fp']:<6} | {m['fn']:<6} | {m['tn']:<6}")
+
+    res_df = pd.DataFrame(results)
+
+    plt.figure(figsize=(9, 5))
+    plt.plot(res_df["lambda"], res_df["mean_recall"], marker="o", label="Recall", color="green")
+    plt.plot(res_df["lambda"], res_df["mean_precision"], marker="s", label="Precision", color="blue")
+    plt.plot(res_df["lambda"], res_df["mean_f1"], marker="^", label="F1 Score", color="orange")
+    plt.title(f"Évolution selon $\\lambda$ (Gamma={gamma}, Mode={stat_mode})")
+    plt.xlabel("Valeur de $\\lambda$")
+    plt.ylabel("Score (%)")
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return res_df
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def plot_strict_heatmap(df, lambda_val=0.8, gamma=0.85, stat_mode="mean", gt_col="preannotation", pred_col="inline_processed"):
+    
+    # 1. Génération du dataframe enrichi
+    df_enriched = apply_citefix(df, lambda_val=lambda_val, stat_mode=stat_mode, gamma=gamma, pred_col=pred_col)
+    
+    # 2. Évaluation silencieuse pour récupérer les compteurs
+    m = evaluate_metrics(df_enriched, gt_col=gt_col, pred_col="inline_processed_citefix", verbose=False)
+    
+    # 3. Préparation de la matrice
+    matrix = np.array([[m["tp"], m["fn"]], [m["fp"], m["tn"]]])
+    total = m["tp"] + m["fp"] + m["fn"] + m["tn"]
+    
+    # Textes avec pourcentages
+    labels = np.array([
+        [f"Vrais Positifs (TP)\n{m['tp']}\n({(m['tp']/total)*100:.1f}%)", f"Faux Négatifs (FN)\n{m['fn']}\n({(m['fn']/total)*100:.1f}%)"],
+        [f"Faux Positifs (FP)\n{m['fp']}\n({(m['fp']/total)*100:.1f}%)", f"Vrais Négatifs (TN)\n{m['tn']}\n({(m['tn']/total)*100:.1f}%)"]
+    ])
+    
+    # 4. Tracé
+    plt.figure(figsize=(7, 5))
+    sns.heatmap(matrix, annot=labels, fmt="", cmap="Blues", cbar=False,
+                xticklabels=["Prédit Cité (1)", "Prédit Non-Cité (0)"],
+                yticklabels=["Attendu GT (1)", "Non-Attendu GT (0)"])
+    plt.title(f"Matrice de Confusion des Chunks\n(Lambda={lambda_val} | Gamma={gamma} | Mode={stat_mode})")
+    plt.ylabel("Vérité Terrain (Ground Truth)")
+    plt.xlabel("Prédiction (Après CiteFix)")
+    plt.tight_layout()
+    plt.show()
+
+
+
+
+
+
+
+
+
+
+
+def plot_strict_heatmap(df, lambda_val=0.8, gamma=0.85, stat_mode="mean", gt_col="preannotation", pred_col="inline_processed"):
+    
+    # 1. Génération du dataframe enrichi
+    df_enriched = apply_citefix(df, lambda_val=lambda_val, stat_mode=stat_mode, gamma=gamma, pred_col=pred_col)
+    
+    # 2. Évaluation silencieuse pour récupérer les compteurs
+    m = evaluate_metrics(df_enriched, gt_col=gt_col, pred_col="inline_processed_citefix", verbose=False)
+    
+    # 3. Préparation de la matrice
+    matrix = np.array([[m["tp"], m["fn"]], [m["fp"], m["tn"]]])
+    total = m["tp"] + m["fp"] + m["fn"] + m["tn"]
+    
+    # Textes avec pourcentages
+    labels = np.array([
+        [f"Vrais Positifs (TP)\n{m['tp']}\n({(m['tp']/total)*100:.1f}%)", f"Faux Négatifs (FN)\n{m['fn']}\n({(m['fn']/total)*100:.1f}%)"],
+        [f"Faux Positifs (FP)\n{m['fp']}\n({(m['fp']/total)*100:.1f}%)", f"Vrais Négatifs (TN)\n{m['tn']}\n({(m['tn']/total)*100:.1f}%)"]
+    ])
+    
+    # 4. Tracé
+    plt.figure(figsize=(7, 5))
+    sns.heatmap(matrix, annot=labels, fmt="", cmap="Blues", cbar=False,
+                xticklabels=["Prédit Cité (1)", "Prédit Non-Cité (0)"],
+                yticklabels=["Attendu GT (1)", "Non-Attendu GT (0)"])
+    plt.title(f"Matrice de Confusion des Chunks\n(Lambda={lambda_val} | Gamma={gamma} | Mode={stat_mode})")
+    plt.ylabel("Vérité Terrain (Ground Truth)")
+    plt.xlabel("Prédiction (Après CiteFix)")
+    plt.tight_layout()
+    plt.show()
