@@ -1,0 +1,123 @@
+import ast
+import numpy as np
+
+def parse_citation_ids(val):
+    if val is None:
+        return set()
+    if isinstance(val, str):
+        try:
+            parsed = ast.literal_eval(val)
+            if isinstance(parsed, list):
+                return set(int(x) for x in parsed)
+            elif isinstance(parsed, (int, float)):
+                return {int(parsed)}
+        except:
+            return set()
+    if isinstance(val, (list, np.ndarray, set)):
+        return set(int(x) for x in val)
+    return set()
+
+def evaluate_chunk_classification_metrics(df, gt_col='preannotation', pred_col='inline_processed'):
+    """
+    Évalue la classification (Cité vs Non-Cité) de CHAQUE chunk du contexte
+    pour CHAQUE snippet individuel.
+    """
+    total_snippets = 0
+    total_chunks_evaluated = 0
+    
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
+    total_tn = 0
+
+    sum_snippet_recall = 0.0
+    sum_snippet_precision = 0.0
+    sum_snippet_f1 = 0.0
+    count_exact_match = 0
+
+    for idx, row in df.iterrows():
+        # 1. Récupération de TOUS les chunks disponibles dans le contexte
+        context_doc_ids = set(int(ctx["id"]) for ctx in row["contexts"])
+        num_docs_in_context = len(context_doc_ids)
+
+        # 2. Parsing du GT et des Prédictions
+        gt_raw = row[gt_col]
+        pred_raw = row[pred_col]
+
+        gt_map = {}
+        for s in (gt_raw if isinstance(gt_raw, list) else []):
+            if isinstance(s, dict) and 'snippet_id' in s:
+                pred_key = 'prediction' if 'prediction' in s else 'citations'
+                gt_map[int(s['snippet_id'])] = parse_citation_ids(s.get(pred_key, []))
+
+        pred_map = {}
+        for s in (pred_raw if isinstance(pred_raw, list) else []):
+            if isinstance(s, dict) and 'snippet_id' in s:
+                pred_key = 'citations' if 'citations' in s else 'prediction'
+                pred_map[int(s['snippet_id'])] = parse_citation_ids(s.get(pred_key, []))
+
+        all_snippet_ids = set(gt_map.keys()) | set(pred_map.keys())
+
+        # 3. Évaluation snippet par snippet
+        for sid in all_snippet_ids:
+            total_snippets += 1
+            total_chunks_evaluated += num_docs_in_context
+
+            gt_set = gt_map.get(sid, set())
+            pred_set = pred_map.get(sid, set())
+
+            # Décompte exact des 4 quadrants pour ce snippet
+            tp = len(gt_set & pred_set)
+            fp = len(pred_set - gt_set)
+            fn = len(gt_set - pred_set)
+            tn = len(context_doc_ids - (gt_set | pred_set))
+
+            total_tp += tp
+            total_fp += fp
+            total_fn += fn
+            total_tn += tn
+
+            # Métriques locales du snippet
+            if len(gt_set) == 0 and len(pred_set) == 0:
+                rec, prec, f1 = 1.0, 1.0, 1.0
+                is_exact = True
+            else:
+                prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1 = (2 * prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+                is_exact = (gt_set == pred_set)
+
+            sum_snippet_recall += rec
+            sum_snippet_precision += prec
+            sum_snippet_f1 += f1
+            if is_exact:
+                count_exact_match += 1
+
+    # Métriques globales
+    chunk_accuracy = (total_tp + total_tn) / total_chunks_evaluated if total_chunks_evaluated > 0 else 0.0
+    
+    print("\n" + "="*85)
+    print("📊 BILAN DE LA CLASSIFICATION DES CHUNKS (PAR SNIPPET)")
+    print("="*85)
+    print(f"Total Snippets analysés       : {total_snippets}")
+    print(f"Total Décisions Chunks (Docs) : {total_chunks_evaluated}")
+    print(f"Chunks BIEN classifiés (TP+TN): {total_tp + total_tn} ({chunk_accuracy*100:.2f}%)")
+    print(f"  ├─ Vrais Positifs (TP)      : {total_tp} (Citations bien attribuées)")
+    print(f"  └─ Vrais Négatifs (TN)      : {total_tn} (Docs hors-sujet bien ignorés)")
+    print(f"Chunks MAL classifiés (FP+FN) : {total_fp + total_fn}")
+    print(f"  ├─ Faux Positifs  (FP)      : {total_fp} (Sur-citations inutiles)")
+    print(f"  └─ Faux Négatifs  (FN)      : {total_fn} (Citations manquées/oubliées)")
+    print("-" * 85)
+    print(f"Moyenne Rappel (Recall)       : {(sum_snippet_recall / total_snippets)*100:.2f}%")
+    print(f"Moyenne Précision (Precision) : {(sum_snippet_precision / total_snippets)*100:.2f}%")
+    print(f"Moyenne F1 Score              : {(sum_snippet_f1 / total_snippets)*100:.2f}%")
+    print(f"Exact Match Snippets          : {(count_exact_match / total_snippets)*100:.2f}%")
+    print("="*85)
+
+    return {
+        "tp": total_tp, "fp": total_fp, "fn": total_fn, "tn": total_tn,
+        "chunk_accuracy": chunk_accuracy,
+        "mean_recall": (sum_snippet_recall / total_snippets) * 100,
+        "mean_precision": (sum_snippet_precision / total_snippets) * 100,
+        "mean_f1": (sum_snippet_f1 / total_snippets) * 100
+    }
