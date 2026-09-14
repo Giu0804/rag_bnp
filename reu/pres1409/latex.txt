@@ -1,0 +1,28 @@
+Let $x_i$ be the factual segment studied. Let $\mathcal{C}_i$ be the set of chunks initially cited by the LLM for this segment $x_i$. Let $f(x_i, \hat{x}_j)$ be the overall hybrid match score calculated for the segment $x_i$ and a candidate chunk $\hat{x}_j$.
+
+We define an adjustment factor $\gamma > 0$: $\gamma < 1$ is a tolerance factor and $\gamma > 1$ is a strictness factor.
+
+
+
+\paragraph{Mean validation}
+We calculate the mean of the scores of the chunks $\mathcal{C}_i$. The acceptance threshold is defined by:
+$\tau_{\text{mean}} = \gamma \cdot \frac{1}{\vert \mathcal{C}_i \vert} \sum_{\hat{x}_k \in \mathcal{C}_i} f(x_i, \hat{x}_k)$. We accept citations whose score is above this threshold.
+
+\paragraph{Max validation}
+We determine the maximum score among the chunks $\mathcal{C}_i$. The acceptance threshold is defined by
+$\tau_{\text{max}} = \gamma \cdot \max_{\hat{x}_k \in \mathcal{C}_i} f(x_i, \hat{x}_k)$. This is the strictest configuration
+
+\paragraph{Min validation}
+We determine the minimum score among the chunks $\mathcal{C}_i$. The acceptance threshold is defined by:
+$\tau_{\text{min}} = \gamma \cdot \min_{\hat{x}_k \in \mathcal{C}_i} f(x_i, \hat{x}_k)$. This is the most flexible configuration.
+
+Finally, for all three configuration, we have: 
+
+$$\mathcal{C}^*_i = \mathcal{C}_i \cup \left\{ \hat{x}_j \notin \mathcal{C}_i \mid f(x_i, \hat{x}_j) \geq \tau_i \right\}$$
+
+From an experimental standpoint, we performed a parameter exploration on $\gamma$ and $\lambda$ for the three scenarios above.
+In particular, we tested:
+\begin{itemize}[noitemsep]
+  \item $\gamma \in [0.4, 1.7]$ with a step of 0.05
+  \item $\lambda \in [0.1, 1]$ with a step of 0.05
+\end{itemize}
