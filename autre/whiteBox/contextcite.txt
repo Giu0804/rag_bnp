@@ -163,3 +163,55 @@ def display_ablation_results(df_res):
                 
             print(f"  -> Suppression chunk ID {chunk_id} --> Score d'impact : {score} {status}")
         print("="*40 + "\n")
+
+
+
+
+
+
+
+
+
+####################################""
+
+
+conseil gemini sinon y a un psosible decalage 
+
+def get_response_log_prob(model, tokenizer, system_prompt, user_prompt, generated_answer):
+    prompt_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    # 1. On tokenize le prompt d'entrée jusqu'à l'amorce de l'assistant
+    prompt_ids = tokenizer.apply_chat_template(
+        prompt_messages, 
+        tokenize=True, 
+        add_generation_prompt=True, 
+        return_tensors="pt"
+    ).to(model.device)
+    
+    # 2. On tokenize la séquence complète incluant la réponse
+    full_messages = prompt_messages + [{"role": "assistant", "content": generated_answer}]
+    full_ids = tokenizer.apply_chat_template(
+        full_messages, 
+        tokenize=True, 
+        add_generation_prompt=False, 
+        return_tensors="pt"
+    ).to(model.device)
+
+    prompt_len = prompt_ids.shape[1]
+    
+    with torch.no_grad():
+        outputs = model(full_ids)
+        logits = outputs.logits  # [batch_size, seq_len, vocab_size]
+
+    # 3. Décalage causal : le logit en position [t-1] prédit le token en position [t]
+    # On commence la prédiction au premier token de la réponse (index prompt_len)
+    shift_logits = logits[:, prompt_len - 1 : -1, :].contiguous()
+    shift_labels = full_ids[:, prompt_len:].contiguous()
+
+    # 4. Calcul direct et vectorisé des log-probabilités
+    log_probs = torch.log_softmax(shift_logits, dim=-1)
+    target_log_probs = torch.gather(log_probs, 2, shift_labels.unsqueeze(-1)).squeeze(-1)
+
+    return target_log_probs.sum().item()
