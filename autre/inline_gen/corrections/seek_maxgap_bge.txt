@@ -103,11 +103,11 @@ def calculate_aggregated_sample_metrics(df, gt_col='preannotation', pred_col='in
 
 
 
+import torch
+import numpy as np
+import pandas as pd
+
 def run_seek_per_snippet(df, embed_model, w=1, k=3):
-    """
-    Applique SEEK (fenêtrage + lissage + elbow) pour isoler les candidats pertinents 
-    pour chaque snippet individuellement.
-    """
     results = []
 
     for idx, row in df.iterrows():
@@ -120,17 +120,30 @@ def run_seek_per_snippet(df, embed_model, w=1, k=3):
             results.append(row_dict)
             continue
 
-        # 1. Préparation des chunks du contexte
-        chunk_texts = [c['text'] for c in contexts]
-        chunk_ids = [int(c['id']) for c in contexts]
-        N = len(chunk_texts)
+        # 1. Découpage en sous-unités (phrases) et mapping des IDs
+        all_sentences = []
+        sentence_chunk_ids = []
         
-        # 2. Vectorisation Qwen 3 (Contextes et Snippets)
-        e_sentences = embed_model.encode(chunk_texts, convert_to_tensor=True)
+        for chunk in contexts:
+            c_id = int(chunk['id'])
+            # Utilisation de ta fonction de split existante
+            sentences = split_insurance_text(chunk['text'])
+            all_sentences.extend(sentences)
+            sentence_chunk_ids.extend([c_id] * len(sentences))
+
+        N = len(all_sentences)
+        if N == 0:
+            row_dict = row.to_dict()
+            row_dict['seek_candidates'] = []
+            results.append(row_dict)
+            continue
+
+        # 2. Vectorisation (Phrases et Snippets)
+        e_sentences = embed_model.encode(all_sentences, convert_to_tensor=True)
         snippet_texts = [s['text'] for s in inline_processed]
         e_snippets = embed_model.encode(snippet_texts, convert_to_tensor=True)
 
-        # 3. Fenêtrage glissant SEEK sur le contexte
+        # 3. Fenêtres contextuelles glissantes SEEK
         window_embeddings = []
         for i in range(N):
             start = max(0, i - w)
@@ -139,7 +152,7 @@ def run_seek_per_snippet(df, embed_model, w=1, k=3):
             window_embeddings.append(v_i)
         window_embeddings = torch.stack(window_embeddings)
 
-        # 4. Similarité Cosinus
+        # 4. Similarité brute
         win_norm = torch.nn.functional.normalize(window_embeddings, p=2, dim=1)
         snip_norm = torch.nn.functional.normalize(e_snippets, p=2, dim=1)
         similarity_matrix = torch.mm(snip_norm.float(), win_norm.T.float()).cpu().numpy()
@@ -152,11 +165,12 @@ def run_seek_per_snippet(df, embed_model, w=1, k=3):
             end = min(N, i + half_k + 1)
             smoothed_matrix[:, i] = np.mean(similarity_matrix[:, start:end], axis=1)
 
-        # 6. Extraction des candidats via Elbow par snippet
+        # 6. Seuillage adaptatif (Elbow) par snippet et validation du chunk parent
         seek_candidates_list = []
+        
         for s_idx, snippet in enumerate(inline_processed):
-            scores = smoothed_matrix[s_idx]
-            sorted_scores = np.sort(scores)[::-1]
+            scores_for_snippet = smoothed_matrix[s_idx]
+            sorted_scores = np.sort(scores_for_snippet)[::-1]
             
             if len(sorted_scores) < 2:
                 tau_elbow = sorted_scores[0] if len(sorted_scores) > 0 else 0
@@ -165,15 +179,16 @@ def run_seek_per_snippet(df, embed_model, w=1, k=3):
                 elbow_idx = np.argmax(gaps)
                 tau_elbow = sorted_scores[elbow_idx + 1]
 
-            # Stocker UNIQUEMENT les candidats qui passent le coude SEEK
-            candidates_for_snippet = []
-            for i, score in enumerate(scores):
+            # Validation : si une phrase passe le seuil, le chunk parent est sélectionné
+            pred_cited_set = set()
+            for i, score in enumerate(scores_for_snippet):
                 if score >= tau_elbow:
-                    candidates_for_snippet.append(chunk_ids[i])
+                    c_id = sentence_chunk_ids[i]
+                    pred_cited_set.add(c_id)
                     
             seek_candidates_list.append({
                 "snippet_id": snippet["snippet_id"],
-                "candidates": candidates_for_snippet
+                "candidates": list(pred_cited_set) # Liste des chunks parents validés
             })
 
         row_dict = row.to_dict()
@@ -181,57 +196,6 @@ def run_seek_per_snippet(df, embed_model, w=1, k=3):
         results.append(row_dict)
 
     return pd.DataFrame(results)
-
-
-
-
-def cache_bge_scores(df, tokenizer, model, batch_size=128):
-    """
-    Exécute BGE uniquement sur les paires (Snippet, Chunk_Candidat) identifiées par SEEK.
-    Retourne un dictionnaire imbriqué : cache[row_idx][snippet_id][chunk_id] = score
-    """
-    all_pairs = []
-    mapping = [] # (row_idx, snippet_id, chunk_id)
-    
-    # 1. Collecte des paires
-    for row_idx, row in df.iterrows():
-        contexts = {int(c['id']): c['text'] for c in row.get("contexts", [])}
-        inline_processed = {int(s['snippet_id']): s['text'] for s in row.get("inline_processed", [])}
-        seek_candidates = row.get("seek_candidates", [])
-        
-        for sc in seek_candidates:
-            s_id = int(sc["snippet_id"])
-            s_text = inline_processed.get(s_id, "")
-            
-            for c_id in sc["candidates"]:
-                c_text = contexts.get(c_id, "")
-                if s_text and c_text:
-                    all_pairs.append([s_text, c_text])
-                    mapping.append((row_idx, s_id, c_id))
-
-    # 2. Inférence Massive par Batch
-    all_scores = []
-    for i in tqdm(range(0, len(all_pairs), batch_size), desc="GPU BGE Inference"):
-        batch_pairs = all_pairs[i : i + batch_size]
-        inputs = tokenizer(batch_pairs, padding=True, truncation=True, return_tensors='pt', max_length=512).to('cuda')
-        
-        with torch.no_grad():
-            outputs = model(**inputs)
-            logits = torch.sigmoid(outputs.logits.view(-1).float()).cpu().numpy()
-            all_scores.extend(logits)
-
-    # 3. Remplissage du Cache
-    cache = {}
-    for (row_idx, s_id, c_id), score in zip(mapping, all_scores):
-        if row_idx not in cache:
-            cache[row_idx] = {}
-        if s_id not in cache[row_idx]:
-            cache[row_idx][s_id] = {}
-            
-        cache[row_idx][s_id][c_id] = float(np.round(score, 4))
-        
-    return cache
-
 
 
 
