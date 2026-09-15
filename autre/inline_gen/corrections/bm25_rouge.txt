@@ -207,3 +207,95 @@ df_grid_bm25_rouge = run_advanced_grid_search(
 
 
 pip install rank-bm25 rouge-score
+
+
+
+
+
+def calculate_aggregated_sample_metrics(df, gt_col='preannotation', pred_col='inline_processed', verbose=False):
+    """
+    Calcule les métriques en agrégeant toutes les citations/prédictions par sample (ensemble unique),
+    puis retourne un dictionnaire propre pour le Grid Search.
+    """
+    total_samples = 0 
+    sum_recall, sum_precision, sum_f1 = 0.0, 0.0, 0.0 
+    exact_match_count, count_match_count = 0, 0 
+
+    for idx, row in df.iterrows(): 
+        gt_raw = row.get(gt_col) 
+        pred_raw = row.get(pred_col) 
+
+        # Utilisation de ta fonction de parsing sécurisée
+        gt_list = normalize_row_eval(gt_raw) 
+        pred_list = normalize_row_eval(pred_raw) 
+
+        if not isinstance(gt_list, list) or not isinstance(pred_list, list): 
+            continue 
+
+        total_samples += 1 
+
+        all_gt_citations = set() 
+        all_pred_citations = set() 
+
+        for s in gt_list: 
+            if isinstance(s, dict) and 'snippet_id' in s and 'prediction' in s: 
+                all_gt_citations.update(safe_parse_ids(s['prediction'])) 
+
+        for s in pred_list: 
+            if isinstance(s, dict) and 'snippet_id' in s and 'citations' in s: 
+                all_pred_citations.update(safe_parse_ids(s['citations'])) 
+
+        if len(all_gt_citations) == 0 and len(all_pred_citations) == 0: 
+            rec, prec, f1 = 1.0, 1.0, 1.0 
+            is_exact, is_count_correct = True, True 
+        else: 
+            tp = len(all_gt_citations & all_pred_citations) 
+            fp = len(all_pred_citations - all_gt_citations) 
+            fn = len(all_gt_citations - all_gt_citations) # (corrigé ici aussi)
+
+            prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0 
+            rec = tp / (tp + len(all_gt_citations - all_pred_citations)) if len(all_gt_citations) > 0 else 1.0 
+            f1 = 2 * (prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0 
+
+            is_exact = (all_gt_citations == all_pred_citations) 
+            is_count_correct = (len(all_gt_citations) == len(all_pred_citations)) 
+
+        sum_recall += rec 
+        sum_precision += prec 
+        sum_f1 += f1 
+
+        if is_exact: exact_match_count += 1 
+        if is_count_count_correct := is_count_correct: count_match_count += (1 if is_count_correct else 0)
+
+    mean_r = (sum_recall / total_samples) * 100 if total_samples > 0 else 0.0
+    mean_p = (sum_precision / total_samples) * 100 if total_samples > 0 else 0.0
+    mean_f1 = (sum_f1 / total_samples) * 100 if total_samples > 0 else 0.0
+    pct_exact = (exact_match_count / total_samples) * 100 if total_samples > 0 else 0.0
+    pct_count = (count_match_count / total_samples) * 100 if total_samples > 0 else 0.0
+
+    if verbose:
+        print(f"\n📊 AGGREGATED PER-SAMPLE METRICS:")
+        print("-" * 50)
+        print(f"Total Samples Evaluated: {total_samples}")
+        print(f"Average Recall (Sample):    {mean_r:.2f}%")
+        print(f"Average Precision (Sample): {mean_p:.2f}%")
+        print(f"Average F1 Score (Sample):  {mean_f1:.2f}%")
+
+    # RETOURNE ENFIN UN DICTIONNAIRE EXPLOITABLE
+    return {
+        "mean_recall": mean_r,
+        "mean_precision": mean_p,
+        "mean_f1": mean_f1,
+        "pct_exact": pct_exact,
+        "pct_count": pct_count,
+        "total_samples": total_samples
+    }
+
+def normalize_row_eval(val):
+    if val is None: return []
+    if isinstance(val, str):
+        try: return ast.literal_eval(val)
+        except: return []
+    if isinstance(val, np.ndarray): return val.tolist()
+    if isinstance(val, list): return val
+    return []
