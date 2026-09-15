@@ -212,6 +212,156 @@ pip install rank-bm25 rouge-score
 
 
 
+import re
+from rank_bm25 import BM25Okapi
+from rouge_score import rouge_scorer
+
+def cache_bm25_rouge_scores(df):
+    """
+    Calcule et met en cache une seule fois les scores BM25 (normalisés) et ROUGE-L 
+    pour chaque paire (snippet, document).
+    """
+    cache = {}
+    print(">> Pré-calcul et mise en cache des scores BM25 et ROUGE-L...")
+    
+    for row_idx, row in df.iterrows():
+        contexts = row.get("contexts", [])
+        inline_processed = row.get("inline_processed", [])
+        
+        if not contexts or not inline_processed:
+            continue
+            
+        # Préparation du corpus BM25 pour ce sample
+        doc_tokens_list = []
+        doc_ids = []
+        for ctx in contexts:
+            d_id = int(ctx['id'])
+            tokens = re.findall(r"\b\w+\b", str(ctx['text']).lower())
+            doc_tokens_list.append(tokens)
+            doc_ids.append(d_id)
+            
+        bm25 = BM25Okapi(doc_tokens_list)
+        scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+        
+        row_cache = {}
+        for item in inline_processed:
+            sid = int(item["snippet_id"])
+            s_text = str(item.get("text", ""))
+            s_tokens = re.findall(r"\b\w+\b", s_text.lower())
+            
+            if not s_tokens or not doc_ids:
+                row_cache[sid] = {d_id: {'bm25': 0.0, 'rouge': 0.0} for d_id in doc_ids}
+                continue
+                
+            # Calcul et normalisation Min-Max de BM25 pour ce snippet
+            raw_bm25 = bm25.get_scores(s_tokens)
+            min_b, max_b = np.min(raw_bm25), np.max(raw_bm25)
+            if max_b - min_b > 1e-5:
+                norm_bm25 = (raw_bm25 - min_b) / (max_b - min_b)
+            else:
+                norm_bm25 = np.zeros_like(raw_bm25)
+                
+            row_cache[sid] = {}
+            for idx, d_id in enumerate(doc_ids):
+                b_score = float(norm_bm25[idx])
+                
+                # Calcul ROUGE-L F1
+                doc_text = str(contexts[idx].get("text", ""))
+                rouge_res = scorer.score(doc_text, s_text)
+                r_score = float(rouge_res['rougeL'].fmeasure)
+                
+                row_cache[sid][d_id] = {
+                    'bm25': b_score,
+                    'rouge': r_score
+                }
+        cache[row_idx] = row_cache
+        
+    print(">> Cache généré avec succès !")
+    return cache
+
+
+
+def run_cached_advanced_grid_search(df, score_cache, lambda_start=0.1, lambda_end=0.9, step=0.1, gamma=0.85, stat_mode="max"):
+    lambdas = np.arange(lambda_start, lambda_end + 1e-5, step)
+    results = []
+    
+    print(f"\n{'='*105}")
+    print(f"{'GRID SEARCH CITEFIX V2 (RAPIDE VIA CACHE)':^105}")
+    print(f"{'='*105}")
+    print(f"{'Lambda':<8} | {'Snippet Rappel%':<15} | {'Snippet Préc%':<15} | {'Snippet F1%':<12} | {'Réponse Rappel%':<15} | {'Réponse Préc%':<15}")
+    print(f"{'-'*105}")
+
+    for l_val in lambdas:
+        l_val = round(l_val, 3)
+        temp_col = []
+
+        for row_idx, row in df.iterrows():
+            inline_processed = row.get("inline_processed", [])
+            row_cache = score_cache.get(row_idx, {})
+            
+            enriched_snippets = []
+            for item in inline_processed:
+                sid = int(item["snippet_id"])
+                base_cits = safe_parse_ids(item.get("citations", item.get("citation", [])))
+                
+                # 1. Calcul combiné instantané depuis le cache
+                scores_for_snip = {}
+                doc_scores_dict = row_cache.get(sid, {})
+                for d_id, metrics in doc_scores_dict.items():
+                    s_ij = (l_val * metrics['bm25']) + ((1.0 - l_val) * metrics['rouge'])
+                    scores_for_snip[d_id] = float(np.round(s_ij, 4))
+
+                # 2. Validation adaptative (stat + gamma)
+                if len(base_cits) > 0:
+                    initial_scores = [scores_for_snip.get(int(c), 0.0) for c in base_cits]
+                    if stat_mode == "mean": ref_stat = float(np.mean(initial_scores))
+                    elif stat_mode == "max": ref_stat = float(np.max(initial_scores))
+                    elif stat_mode == "min": ref_stat = float(np.min(initial_scores))
+                    else: ref_stat = float(np.max(initial_scores))
+                    adaptive_tau = gamma * ref_stat
+                else:
+                    adaptive_tau = 0.30
+
+                # 3. Union conservatrice
+                new_cits = set(base_cits)
+                for d_id, score in scores_for_snip.items():
+                    if score >= adaptive_tau:
+                        new_cits.add(d_id)
+
+                enriched_snippets.append({
+                    "snippet_id": sid,
+                    "text": item.get("text", ""),
+                    "citations": sorted(list(new_cits))
+                })
+            temp_col.append(enriched_snippets)
+
+        df_temp = df.copy()
+        df_temp["temp_eval_col"] = temp_col
+
+        # Évaluation aux deux échelles
+        m_snip = evaluate_per_snippet_metrics(df_temp, gt_col='preannotation', pred_col='temp_eval_col', verbose=False)
+        m_agg = calculate_aggregated_sample_metrics(df_temp, gt_col='preannotation', pred_col='temp_eval_col', verbose=False)
+
+        results.append({
+            "lambda": l_val,
+            "snippet_recall": m_snip['mean_recall'],
+            "snippet_precision": m_snip['mean_precision'],
+            "snippet_f1": m_snip['mean_f1'],
+            "sample_recall": m_agg['mean_recall'],
+            "sample_precision": m_agg['mean_precision']
+        })
+
+        print(f"{l_val:<8.2f} | {m_snip['mean_recall']:<15.2f} | {m_snip['mean_precision']:<15.2f} | "
+              f"{m_snip['mean_f1']:<12.2f} | {m_agg['mean_recall']:<15.2f} | {m_agg['mean_precision']:<15.2f}")
+
+    print(f"{'='*105}\n")
+    return pd.DataFrame(results)
+
+
+
+
+# CA C BON 
+
 def calculate_aggregated_sample_metrics(df, gt_col='preannotation', pred_col='inline_processed', verbose=False):
     """
     Calcule les métriques en agrégeant toutes les citations/prédictions par sample (ensemble unique),
