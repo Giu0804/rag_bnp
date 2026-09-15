@@ -578,3 +578,64 @@ df_grid_gamma = run_gamma_stat_grid_search(
     gamma_values=[0.70, 0.75, 0.80, 0.85, 0.90, 0.95],
     stat_modes=['max', 'mean', 'min']
 )
+
+
+
+
+
+####################################
+
+pour tester intersection avec rouge 
+
+import re
+from rouge_score import rouge_scorer
+
+def cache_intersection_rouge_scores(df):
+    """
+    Calcule et met en cache les scores d'intersection asymétrique et ROUGE-L 
+    pour chaque paire (snippet, document).
+    """
+    cache = {}
+    print(">> Pré-calcul et mise en cache des scores (Intersection + ROUGE-L)...")
+    
+    # Initialisation du scorer ROUGE-L
+    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+    
+    for row_idx, row in df.iterrows():
+        contexts = row.get("contexts", [])
+        inline_processed = row.get("inline_processed", [])
+        
+        if not contexts or not inline_processed:
+            continue
+            
+        row_cache = {}
+        for item in inline_processed:
+            sid = int(item["snippet_id"])
+            s_text = str(item.get("text", ""))
+            s_tokens = set(re.findall(r"\b\w+\b", s_text.lower()))
+            
+            row_cache[sid] = {}
+            for ctx in contexts:
+                d_id = int(ctx['id'])
+                doc_text = str(ctx['text'])
+                doc_tokens = set(re.findall(r"\b\w+\b", doc_text.lower()))
+                
+                # --- A. Calcul de l'Intersection Asymétrique ---
+                if len(s_tokens) == 0:
+                    intersect_score = 0.0
+                else:
+                    common = s_tokens & doc_tokens
+                    intersect_score = len(common) / len(s_tokens)
+                
+                # --- B. Calcul ROUGE-L F1 ---
+                rouge_res = scorer.score(doc_text, s_text)
+                r_score = float(rouge_res['rougeL'].fmeasure)
+                
+                row_cache[sid][d_id] = {
+                    'intersection': float(np.round(intersect_score, 4)),
+                    'rouge': float(np.round(r_score, 4))
+                }
+        cache[row_idx] = row_cache
+        
+    print(">> Cache Intersection + ROUGE-L généré avec succès !")
+    return cache
