@@ -449,3 +449,132 @@ def normalize_row_eval(val):
     if isinstance(val, np.ndarray): return val.tolist()
     if isinstance(val, list): return val
     return []
+
+
+
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+def run_gamma_stat_grid_search(df, score_cache, fixed_lambda=0.9, gamma_values=None, stat_modes=None):
+    """
+    Lance un Grid Search sur gamma et stat_mode ('max', 'mean', 'min') 
+    avec un lambda fixe, en utilisant le score_cache pré-calculé.
+    """
+    if gamma_values is None:
+        gamma_values = [0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+    if stat_modes is None:
+        stat_modes = ['max', 'mean', 'min']
+        
+    results = []
+    
+    print(f"\n{'='*115}")
+    print(f"{f'GRID SEARCH GAMMA & STAT_MODE (Lambda fixe = {fixed_lambda})':^115}")
+    print(f"{'='*115}")
+    print(f"{'Stat Mode':<10} | {'Gamma':<8} | {'Snippet Rappel%':<15} | {'Snippet Préc%':<15} | {'Snippet F1%':<12} | {'Réponse Rappel%':<15} | {'Réponse Préc%':<15}")
+    print(f"{'-'*115}")
+
+    for stat_mode in stat_modes:
+        for gamma in gamma_values:
+            temp_col = []
+
+            for row_idx, row in df.iterrows():
+                inline_processed = row.get("inline_processed", [])
+                row_cache = score_cache.get(row_idx, {})
+                
+                enriched_snippets = []
+                for item in inline_processed:
+                    sid = int(item["snippet_id"])
+                    base_cits = safe_parse_ids(item.get("citations", item.get("citation", [])))
+                    
+                    # 1. Calcul combiné instantané depuis le cache avec le lambda fixe
+                    scores_for_snip = {}
+                    doc_scores_dict = row_cache.get(sid, {})
+                    for d_id, metrics in doc_scores_dict.items():
+                        s_ij = (fixed_lambda * metrics['bm25']) + ((1.0 - fixed_lambda) * metrics['rouge'])
+                        scores_for_snip[d_id] = float(np.round(s_ij, 4))
+
+                    # 2. Validation adaptative selon le stat_mode et le gamma testé
+                    if len(base_cits) > 0:
+                        initial_scores = [scores_for_snip.get(int(c), 0.0) for c in base_cits]
+                        
+                        if stat_mode == "mean": 
+                            ref_stat = float(np.mean(initial_scores))
+                        elif stat_mode == "max": 
+                            ref_stat = float(np.max(initial_scores))
+                        elif stat_mode == "min": 
+                            ref_stat = float(np.min(initial_scores))
+                        else: 
+                            ref_stat = float(np.max(initial_scores))
+                            
+                        adaptive_tau = gamma * ref_stat
+                    else:
+                        adaptive_tau = 0.30  # Fallback si aucune citation de base
+
+                    # 3. UNION CONSERVATRICE : On garde tout l'existant + les ajouts
+                    new_cits = set(base_cits)
+                    for d_id, score in scores_for_snip.items():
+                        if score >= adaptive_tau:
+                            new_cits.add(d_id)
+
+                    enriched_snippets.append({
+                        "snippet_id": sid,
+                        "text": item.get("text", ""),
+                        "citations": sorted(list(new_cits))
+                    })
+                temp_col.append(enriched_snippets)
+
+            df_temp = df.copy()
+            df_temp["temp_eval_col"] = temp_col
+
+            # Évaluation aux deux échelles
+            m_snip = evaluate_per_snippet_metrics(df_temp, gt_col='preannotation', pred_col='temp_eval_col', verbose=False)
+            m_agg = calculate_aggregated_sample_metrics(df_temp, gt_col='preannotation', pred_col='temp_eval_col', verbose=False)
+
+            results.append({
+                "stat_mode": stat_mode,
+                "gamma": gamma,
+                "snippet_recall": m_snip['mean_recall'],
+                "snippet_precision": m_snip['mean_precision'],
+                "snippet_f1": m_snip['mean_f1'],
+                "sample_recall": m_agg['mean_recall'],
+                "sample_precision": m_agg['mean_precision']
+            })
+
+            print(f"{stat_mode:<10} | {gamma:<8.2f} | {m_snip['mean_recall']:<15.2f} | {m_snip['mean_precision']:<15.2f} | "
+                  f"{m_snip['mean_f1']:<12.2f} | {m_agg['mean_recall']:<15.2f} | {m_agg['mean_precision']:<15.2f}")
+
+    print(f"{'='*115}\n")
+    res_df = pd.DataFrame(results)
+
+    # --- TRACÉ DES COURBES COMPARATIVES PAR STAT_MODE ---
+    plt.figure(figsize=(11, 6))
+    
+    colors = {'max': '#2ca02c', 'mean': '#1f77b4', 'min': '#ff7f0e'}
+    for sm in stat_modes:
+        sub_df = res_df[res_df['stat_mode'] == sm]
+        plt.plot(sub_df["gamma"], sub_df["snippet_recall"], marker='o', label=f"Rappel ({sm})", color=colors.get(sm, 'black'), linewidth=2)
+        plt.plot(sub_df["gamma"], sub_df["snippet_precision"], marker='s', linestyle="--", label=f"Précision ({sm})", color=colors.get(sm, 'black'), linewidth=1.5)
+
+    plt.title(f"Impact de $\gamma$ et du Mode de Validation sur les métriques (Lambda={fixed_lambda})", fontsize=13, pad=12)
+    plt.xlabel("Valeur de $\gamma$", fontsize=11)
+    plt.ylabel("Score (%)", fontsize=11)
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.legend(fontsize=10, bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.show()
+
+    return res_df
+
+
+
+
+df_grid_gamma = run_gamma_stat_grid_search(
+    df=df_propre, 
+    score_cache=score_cache, 
+    fixed_lambda=0.9, # Tu mets la valeur de lambda qui marchait le mieux chez toi
+    gamma_values=[0.70, 0.75, 0.80, 0.85, 0.90, 0.95],
+    stat_modes=['max', 'mean', 'min']
+)
