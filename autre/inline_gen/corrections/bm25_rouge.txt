@@ -1,0 +1,209 @@
+import numpy as np
+import pandas as pd
+import ast
+import matplotlib.pyplot as plt
+from rank_bm25 import BM25Okapi
+from rouge_score import rouge_scorer
+
+def safe_parse_ids(val):
+    """Ta fonction robuste pour parser les IDs de citations."""
+    if val is None: return set()
+    if isinstance(val, str):
+        try:
+            parsed = ast.literal_eval(val)
+            if isinstance(parsed, list): return set([int(x) for x in parsed])
+            elif isinstance(parsed, (int, float)): return {int(parsed)}
+        except: return set()
+    if isinstance(val, (list, np.ndarray)): return set([int(x) for x in val])
+    return set()
+
+
+
+def compute_advanced_scores_for_sample(row, lambda_val):
+    """
+    Calcule le score hybride S = lambda * BM25_norm + (1 - lambda) * ROUGE-L
+    pour chaque snippet par rapport à chaque document du contexte.
+    """
+    contexts = row.get("contexts", [])
+    inline_processed = row.get("inline_processed", [])
+    
+    if not contexts or not inline_processed:
+        return {}
+
+    # 1. Préparation du corpus pour BM25 (chaque doc est tokenisé en liste de mots)
+    doc_tokens_list = []
+    doc_ids = []
+    for ctx in contexts:
+        d_id = int(ctx["id"])
+        tokens = re.findall(r"\b\w+\b", str(ctx["text"]).lower())
+        doc_tokens_list.append(tokens)
+        doc_ids.append(d_id)
+        
+    bm25 = BM25Okapi(doc_tokens_list)
+    
+    # Initialisation du scorer ROUGE-L
+    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+
+    snippet_scores = {} # {snippet_id: {doc_id: score}}
+
+    for item in inline_processed:
+        sid = int(item["snippet_id"])
+        s_text = str(item.get("text", ""))
+        s_tokens = re.findall(r"\b\w+\b", s_text.lower())
+        
+        if not s_tokens:
+            snippet_scores[sid] = {d_id: 0.0 for d_id in doc_ids}
+            continue
+
+        # --- A. Calcul des scores bruts BM25 ---
+        raw_bm25_scores = bm25.get_scores(s_tokens)
+        
+        # Normalisation Min-Max des scores BM25 pour ce snippet (évite les divisions par zéro)
+        min_b = np.min(raw_bm25_scores)
+        max_b = np.max(raw_bm25_scores)
+        if max_b - min_b > 1e-5:
+            norm_bm25 = (raw_bm25_scores - min_b) / (max_b - min_b)
+        else:
+            norm_bm25 = np.zeros_like(raw_bm25_scores)
+
+        # --- B. Calcul des scores ROUGE-L et Fusion ---
+        snippet_scores[sid] = {}
+        for idx, d_id in enumerate(doc_ids):
+            b_score = float(norm_bm25[idx])
+            
+            # Calcul ROUGE-L F1 entre le snippet et le texte du doc
+            doc_text = str(contexts[idx].get("text", ""))
+            rouge_res = scorer.score(doc_text, s_text)
+            r_score = float(rouge_res['rougeL'].fmeasure)
+            
+            # Équation hybride combinant Fond (BM25) et Forme (ROUGE-L)
+            s_ij = (lambda_val * b_score) + ((1.0 - lambda_val) * r_score)
+            snippet_scores[sid][d_id] = float(np.round(s_ij, 4))
+
+    return snippet_scores
+
+
+
+
+def apply_advanced_adaptive_validation(row, snippet_scores, stat_mode="max", gamma=0.85, fallback_tau=0.30):
+    inline_processed = row.get("inline_processed", [])
+    enriched_snippets = []
+    
+    for item in inline_processed:
+        sid = int(item["snippet_id"])
+        base_cits = safe_parse_ids(item.get("citations", item.get("citation", [])))
+        scores_for_snip = snippet_scores.get(sid, {})
+
+        # 1. Calcul du seuil adaptatif selon tes stats (mean, max, min)
+        if len(base_cits) > 0:
+            initial_scores = [scores_for_snip.get(int(c), 0.0) for c in base_cits]
+            
+            if stat_mode == "mean":
+                ref_stat = float(np.mean(initial_scores))
+            elif stat_mode == "max":
+                ref_stat = float(np.max(initial_scores))
+            elif stat_mode == "min":
+                ref_stat = float(np.min(initial_scores))
+            else:
+                raise ValueError(f"stat_mode inconnu: {stat_mode}")
+                
+            adaptive_tau = gamma * ref_stat
+        else:
+            adaptive_tau = fallback_tau
+
+        # 2. UNION CONSERVATRICE : On part des citations de base
+        new_cits = set(base_cits)
+        
+        # 3. Ajout des nouveaux documents qui dépassent le seuil adaptatif
+        for d_id, score in scores_for_snip.items():
+            if score >= adaptive_tau:
+                new_cits.add(d_id)
+
+        enriched_snippets.append({
+            "snippet_id": sid,
+            "text": item.get("text", ""),
+            "citations": sorted(list(new_cits))
+        })
+
+    return enriched_snippets
+
+
+
+
+
+def run_advanced_grid_search(df, lambda_start=0.1, lambda_end=0.9, step=0.05, gamma=0.85, stat_mode="max"):
+    lambdas = np.arange(lambda_start, lambda_end + 1e-5, step)
+    results = []
+    
+    print(f"\n{'='*105}")
+    print(f"{'GRID SEARCH CITEFIX V2 (BM25 + ROUGE-L)':^105}")
+    print(f"{'='*105}")
+    print(f"{'Lambda':<8} | {'Snippet Rappel%':<15} | {'Snippet Préc%':<15} | {'Snippet F1%':<12} | {'Réponse Rappel%':<15} | {'Réponse Préc%':<15}")
+    print(f"{'-'*105}")
+
+    for l_val in lambdas:
+        l_val = round(l_val, 3)
+        temp_col = []
+
+        for _, row in df.iterrows():
+            scores = compute_advanced_scores_for_sample(row, lambda_val=l_val)
+            enriched = apply_advanced_adaptive_validation(row, scores, stat_mode=stat_mode, gamma=gamma)
+            temp_col.append(enriched)
+
+        df_temp = df.copy()
+        df_temp["temp_eval_col"] = temp_col
+
+        # Évaluation aux deux échelles avec tes fonctions exactes
+        m_snip = evaluate_per_snippet_metrics(df_temp, gt_col='preannotation', pred_col='temp_eval_col', verbose=False)
+        m_agg = calculate_aggregated_sample_metrics(df_temp, gt_col='preannotation', pred_col='temp_eval_col')
+
+        results.append({
+            "lambda": l_val,
+            "snippet_recall": m_snip['mean_recall'],
+            "snippet_precision": m_snip['mean_precision'],
+            "snippet_f1": m_snip['mean_f1'],
+            "sample_recall": m_agg['mean_recall'],
+            "sample_precision": m_agg['mean_precision']
+        })
+
+        print(f"{l_val:<8.2f} | {m_snip['mean_recall']:<15.2f} | {m_snip['mean_precision']:<15.2f} | "
+              f"{m_snip['mean_f1']:<12.2f} | {m_agg['mean_recall']:<15.2f} | {m_agg['mean_precision']:<15.2f}")
+
+    print(f"{'='*105}\n")
+    res_df = pd.DataFrame(results)
+
+    # Courbe des métriques (Échelle Snippet)
+    plt.figure(figsize=(10, 5))
+    plt.plot(res_df["lambda"], res_df["snippet_recall"], marker='o', label="Rappel (Snippet)", color="#2ca02c", linewidth=2.5)
+    plt.plot(res_df["lambda"], res_df["snippet_precision"], marker='s', label="Précision (Snippet)", color="#1f77b4", linewidth=2)
+    plt.plot(res_df["lambda"], res_df["snippet_f1"], marker='^', label="F1-Score (Snippet)", color="#ff7f0e", linestyle="--")
+
+    plt.title(f"Évolution des métriques (BM25 + ROUGE-L) selon $\lambda$ (gamma={gamma}, mode={stat_mode})", fontsize=12, pad=12)
+    plt.xlabel("Valeur de $\lambda$ (Poids de BM25)", fontsize=11)
+    plt.ylabel("Score (%)", fontsize=11)
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.legend(fontsize=11)
+    plt.tight_layout()
+    plt.show()
+
+    return res_df
+
+
+
+
+# Nettoyage des NaN sur la vérité terrain
+#df_propre = df_results.dropna(subset=['preannotation']).copy()
+
+# Lancement du Grid Search
+df_grid_bm25_rouge = run_advanced_grid_search(
+    df=df, 
+    lambda_start=0.1, 
+    lambda_end=0.9, 
+    step=0.1, 
+    gamma=0.85, 
+    stat_mode="max"
+)
+
+
+
+pip install rank-bm25 rouge-score
