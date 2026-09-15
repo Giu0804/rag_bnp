@@ -226,6 +226,206 @@ def run_bge_grid_search_with_retention(df, bge_cache, thresholds):
 
 
 
+def calculate_aggregated_sample_metrics(df, gt_col='preannotation', pred_col='inline_processed'): 
+    # [Ton code exact d'origine pour parser et normaliser...]
+    def parse_ids(val):
+        if val is None: return set()
+        if isinstance(val, str):
+            try:
+                parsed = ast.literal_eval(val)
+                if isinstance(parsed, list): return set([int(x) for x in parsed])
+                elif isinstance(parsed, (int, float)): return {int(parsed)}
+            except: return set()
+        if isinstance(val, (list, np.ndarray)): return set([int(x) for x in val])
+        return set()
+
+    def normalize_row(row_val):
+        if row_val is None: return []
+        if isinstance(row_val, str):
+            try: return ast.literal_eval(row_val)
+            except: return []
+        if isinstance(row_val, np.ndarray): return row_val.tolist()
+        if isinstance(row_val, list): return row_val
+        return []
+
+    total_samples = 0 
+    sum_recall, sum_precision, sum_f1 = 0.0, 0.0, 0.0 
+    exact_match_count, count_match_count = 0, 0 
+
+    for idx, row in df.iterrows(): 
+        gt_list = normalize_row(row[gt_col]) 
+        pred_list = normalize_row(row[pred_col]) 
+
+        if not isinstance(gt_list, list) or not isinstance(pred_list, list): 
+            continue 
+
+        total_samples += 1 
+
+        all_gt_citations = set() 
+        all_pred_citations = set() 
+
+        for s in gt_list: 
+            if isinstance(s, dict) and 'snippet_id' in s and 'prediction' in s: 
+                all_gt_citations.update(parse_ids(s['prediction'])) 
+
+        for s in pred_list: 
+            if isinstance(s, dict) and 'snippet_id' in s and 'citations' in s: 
+                all_pred_citations.update(parse_ids(s['citations'])) 
+
+        if len(all_gt_citations) == 0 and len(all_pred_citations) == 0: 
+            rec, prec, f1 = 1.0, 1.0, 1.0 
+            is_exact, is_count_correct = True, True 
+        else: 
+            tp = len(all_gt_citations & all_pred_citations) 
+            fp = len(all_pred_citations - all_gt_citations) 
+            fn = len(all_gt_citations - all_pred_citations) 
+
+            prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0 
+            rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0 
+            f1 = 2 * (prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0 
+
+            is_exact = (all_gt_citations == all_pred_citations) 
+            is_count_correct = (len(all_gt_citations) == len(all_pred_citations)) 
+
+        sum_recall += rec 
+        sum_precision += prec 
+        sum_f1 += f1 
+
+        if is_exact: exact_match_count += 1 
+        if is_count_correct: count_match_count += 1 
+
+    mean_r = (sum_recall/total_samples)*100 if total_samples > 0 else 0.0
+    mean_p = (sum_precision/total_samples)*100 if total_samples > 0 else 0.0
+    mean_f1 = (sum_f1/total_samples)*100 if total_samples > 0 else 0.0
+    pct_exact = (exact_match_count/total_samples)*100 if total_samples > 0 else 0.0
+    pct_count = (count_match_count/total_samples)*100 if total_samples > 0 else 0.0
+
+    return {
+        "mean_recall": mean_r, "mean_precision": mean_p, "mean_f1": mean_f1,
+        "pct_exact": pct_exact, "pct_count": pct_count
+    }
+
+
+def run_bge_grid_search_with_retention(df, bge_cache, thresholds):
+    results = []
+    
+    for thres in thresholds:
+        print(f"\n{'='*95}")
+        print(f" ÉVALUATION POUR LE SEUIL BGE : {thres}")
+        print(f"{'='*95}")
+        
+        temp_eval_col = []
+        for row_idx, row in df.iterrows():
+            row_snippets = []
+            seek_candidates = {sc["snippet_id"]: sc["candidates"] for sc in row.get("seek_candidates", [])}
+            
+            for snippet in row.get("inline_processed", []):
+                s_id = int(snippet["snippet_id"])
+                
+                # 1. UNION CONSERVATRICE : On garde l'existant
+                raw_cits = snippet.get("citations", snippet.get("citation", []))
+                if isinstance(raw_cits, np.ndarray): base_cits = set(raw_cits.tolist())
+                elif isinstance(raw_cits, list): base_cits = set(raw_cits)
+                else: base_cits = set()
+                
+                final_cits = set(base_cits)
+                
+                # 2. Ajout des candidats SEEK validés par BGE
+                for c_id in seek_candidates.get(s_id, []):
+                    score = bge_cache.get(row_idx, {}).get(s_id, {}).get(c_id, 0.0)
+                    if score >= thres:
+                        final_cits.add(c_id)
+                
+                row_snippets.append({
+                    "snippet_id": s_id,
+                    "text": snippet.get("text", ""),
+                    "citations": sorted(list(final_cits))
+                })
+            temp_eval_col.append(row_snippets)
+            
+        df_temp = df.copy()
+        df_temp["temp_eval_col"] = temp_eval_col
+        
+        # --- APPEL DES DEUX ÉCHELLES D'ÉVALUATION ---
+        m_snip = evaluate_per_snippet_metrics(df_temp, gt_col='preannotation', pred_col='temp_eval_col', verbose=False)
+        m_agg = calculate_aggregated_sample_metrics(df_temp, gt_col='preannotation', pred_col='temp_eval_col')
+        
+        # --- AFFICHAGE CLAIR ---
+        print(f"[ÉCHELLE SNIPPET] Rappel: {m_snip['mean_recall']:.2f}% | Précision: {m_snip['mean_precision']:.2f}% | F1: {m_snip['mean_f1']:.2f}% | Exact: {m_snip['pct_exact']:.2f}%")
+        print(f"[ÉCHELLE RÉPONSE] Rappel: {m_agg['mean_recall']:.2f}% | Précision: {m_agg['mean_precision']:.2f}% | F1: {m_agg['mean_f1']:.2f}% | Exact: {m_agg['pct_exact']:.2f}%")
+        
+        results.append({
+            "threshold": thres,
+            "snippet_metrics": m_snip,
+            "aggregated_metrics": m_agg
+        })
+
+    return pd.DataFrame(results)
+
+
+
+
+
+
+# =====================================================================
+# BLOC D'EXÉCUTION PRINCIPAL
+# =====================================================================
+
+# 1. Tu passes ton dataframe (df_results généré par ton EBNF) dans SEEK
+print(">> Lancement de SEEK (Fenêtrage et Coude) sur les snippets...")
+df_seek = run_seek_per_snippet(
+    df=df_results, 
+    embed_model=embed_model, # Ton Qwen 3
+    w=1, 
+    k=3
+)
+
+# 2. Tu mets en cache les scores BGE uniquement pour les candidats trouvés
+print("\n>> Mise en cache des scores BGE...")
+bge_cache = cache_bge_scores(
+    df=df_seek, 
+    tokenizer=tokenizer, # Ton tokenizer BGE
+    model=model,         # Ton modèle BGE Reranker
+    batch_size=128
+)
+
+# 3. Tu lances le Grid Search instantané avec tes seuils
+print("\n>> Lancement du Grid Search...")
+thresholds_list = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+
+# Le grid search va print les métriques (Snippet ET Réponse) pour chaque seuil
+df_grid_results = run_bge_grid_search_with_retention(
+    df=df_seek, 
+    bge_cache=bge_cache, 
+    thresholds=thresholds_list
+)
+
+print("\n>> Terminé.")s
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
