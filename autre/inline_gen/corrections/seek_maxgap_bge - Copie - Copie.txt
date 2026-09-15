@@ -1,0 +1,293 @@
+import torch
+import numpy as np
+import pandas as pd
+from collections import OrderedDict
+
+# Assurez-vous d'avoir instancié embed_model (Qwen) avant d'appeler ceci
+
+def get_seek_candidates_for_row(row, embed_model, w=1, k=3):
+    """
+    Applique la méthode SEEK pour chaque snippet de la ligne.
+    Retourne un dictionnaire avec les candidats (SEEK passés + citations de base conservées).
+    """
+    contexts = row.get("contexts", [])
+    inline_processed = row.get("inline_processed", [])
+    
+    # 1. Préparation globale du contexte pour la ligne
+    all_sentences = []
+    sentence_chunk_ids = []
+    unique_ids = []
+    
+    # Dictionnaire pour retrouver le texte complet du chunk si besoin pour BGE
+    chunk_text_map = {} 
+    
+    for ctx in contexts:
+        c_id = int(ctx["id"])
+        if c_id not in unique_ids:
+            unique_ids.append(c_id)
+        
+        chunk_text_map[c_id] = ctx["text"]
+        sentences = split_insurance_text(ctx["text"])
+        all_sentences.extend(sentences)
+        sentence_chunk_ids.extend([c_id] * len(sentences))
+
+    snippet_results = {}
+    
+    if not all_sentences or not inline_processed:
+        return snippet_results
+
+    # Vectorisation du contexte (une seule fois par ligne)
+    e_sentences = embed_model.encode(all_sentences, convert_to_tensor=True)
+    N = len(all_sentences)
+    
+    # Fenêtre glissante SEEK
+    window_embeddings = []
+    for i in range(N):
+        start = max(0, i - w)
+        end = min(N, i + w + 1)
+        v_i = torch.mean(e_sentences[start:end], dim=0)
+        window_embeddings.append(v_i)
+        
+    window_embeddings = torch.stack(window_embeddings)
+    window_embeddings_norm = torch.nn.functional.normalize(window_embeddings, p=2, dim=1)
+
+    # 2. Traitement par Snippet
+    for item in inline_processed:
+        sid = int(item["snippet_id"])
+        snip_text = item.get("text", "")
+        
+        # Récupération sécurisée des citations de base (qu'on garde coûte que coûte)
+        raw_cits = item.get("citations", item.get("citation", []))
+        if isinstance(raw_cits, np.ndarray):
+            base_cits = set(int(c) for c in raw_cits.tolist())
+        elif isinstance(raw_cits, list):
+            base_cits = set(int(c) for c in raw_cits)
+        else:
+            base_cits = set()
+
+        if not snip_text.strip():
+            # Si le texte est vide, on renvoie juste les citations de base
+            snippet_results[sid] = {
+                "text": snip_text,
+                "base_cits": base_cits,
+                "candidates": base_cits
+            }
+            continue
+
+        # Vectorisation du snippet
+        e_claim = embed_model.encode([snip_text], convert_to_tensor=True)
+        e_claim_norm = torch.nn.functional.normalize(e_claim, p=2, dim=1)
+        
+        # Matrice de similarité brute
+        sim_matrix = torch.mm(e_claim_norm.float(), window_embeddings_norm.T.float()).cpu().numpy()[0]
+        
+        # Temporal Smoothing
+        smoothed_scores = np.zeros_like(sim_matrix)
+        half_k = k // 2
+        for i in range(N):
+            start = max(0, i - half_k)
+            end = min(N, i + half_k + 1)
+            smoothed_scores[i] = np.mean(sim_matrix[start:end])
+
+        # Dynamic Thresholding (Elbow)
+        sorted_scores = np.sort(smoothed_scores)[::-1]
+        if len(sorted_scores) < 2:
+            tau_elbow = sorted_scores[0] if len(sorted_scores) > 0 else 0
+        else:
+            gaps = sorted_scores[:-1] - sorted_scores[1:]
+            elbow_idx = np.argmax(gaps)
+            tau_elbow = sorted_scores[elbow_idx + 1]
+
+        # Identifier les chunks approuvés par SEEK
+        seek_cited = set()
+        for i, score in enumerate(smoothed_scores):
+            if score >= tau_elbow:
+                seek_cited.add(sentence_chunk_ids[i])
+
+        # FUSION : Les candidats incluent toujours les base_cits
+        final_candidates = base_cits.union(seek_cited)
+        
+        snippet_results[sid] = {
+            "text": snip_text,
+            "base_cits": base_cits,
+            "candidates": final_candidates,
+            "chunk_text_map": chunk_text_map # stocké pour l'étape BGE
+        }
+        
+    return snippet_results
+
+
+
+
+
+
+from tqdm import tqdm
+
+def compute_and_cache_bge_scores(df, embed_model, bge_model, bge_tokenizer, batch_size=128):
+    """
+    1. Fait tourner SEEK sur chaque ligne.
+    2. Prépare toutes les paires Snippet-Chunk candidats.
+    3. Fait une inférence batchée avec BGE.
+    4. Retourne un dictionnaire des scores complet.
+    """
+    all_pairs = []
+    mapping = [] # (row_idx, snippet_id, chunk_id)
+    
+    # Stockage de la structure de base (pour le grid search plus tard)
+    # structure : precomputed_data[row_idx][snippet_id] = { 'base_cits': set(), 'bge_scores': {chunk_id: score} }
+    precomputed_data = {}
+
+    print("Étape 1 : Passage de SEEK sur tout le dataset...")
+    for idx, row in tqdm(df.iterrows(), total=len(df)):
+        seek_res = get_seek_candidates_for_row(row, embed_model, w=1, k=3)
+        precomputed_data[idx] = {}
+        
+        for sid, s_data in seek_res.items():
+            precomputed_data[idx][sid] = {
+                "text": s_data["text"],
+                "base_cits": s_data["base_cits"],
+                "bge_scores": {} # À remplir avec BGE
+            }
+            
+            # Créer les paires pour BGE (seulement pour les candidats SEEK + base)
+            for c_id in s_data["candidates"]:
+                chunk_text = s_data["chunk_text_map"].get(c_id, "")
+                if chunk_text:
+                    all_pairs.append([s_data["text"], chunk_text])
+                    mapping.append((idx, sid, c_id))
+
+    print(f"Étape 2 : Inférence BGE sur {len(all_pairs)} paires...")
+    all_scores = []
+    for i in tqdm(range(0, len(all_pairs), batch_size)):
+        batch_pairs = all_pairs[i : i + batch_size]
+        
+        inputs = bge_tokenizer(batch_pairs, padding=True, truncation=True, return_tensors='pt', max_length=512).to('cuda')
+        
+        with torch.no_grad():
+            outputs = bge_model(**inputs)
+            # Logits -> Probabilités (selon le modèle BGE exact, ajustez sigmoid vs softmax si besoin)
+            logits = torch.sigmoid(outputs.logits.view(-1).float()).cpu().numpy()
+            all_scores.extend(logits)
+
+    print("Étape 3 : Mapping des scores...")
+    for (row_idx, sid, chunk_id), score_val in zip(mapping, all_scores):
+        # On sauvegarde le score BGE pour ce chunk précis
+        precomputed_data[row_idx][sid]["bge_scores"][chunk_id] = float(np.round(score_val, 4))
+
+    return precomputed_data
+
+
+
+
+
+
+
+
+def evaluate_per_snippet_metrics(y_true_list, y_pred_list):
+    """Calcule les métriques à l'échelle du snippet (Moyenne F1, Rappel, Précision)."""
+    precisions, recalls, f1_scores, exact_matches = [], [], [], []
+    
+    for gt, pred in zip(y_true_list, y_pred_list):
+        em = 1.0 if set(gt) == set(pred) else 0.0
+        exact_matches.append(em)
+        
+        if not pred:
+            p = 1.0 if not gt else 0.0
+            r = 1.0 if not gt else 0.0
+        else:
+            intersection = set(gt).intersection(set(pred))
+            p = len(intersection) / len(pred)
+            r = len(intersection) / len(gt) if gt else 1.0
+            
+        f1 = (2 * p * r) / (p + r) if (p + r) > 0 else 0.0
+        
+        precisions.append(p)
+        recalls.append(r)
+        f1_scores.append(f1)
+        
+    return {
+        "mean_precision": np.mean(precisions) * 100,
+        "mean_recall": np.mean(recalls) * 100,
+        "mean_f1": np.mean(f1_scores) * 100,
+        "pct_exact": np.mean(exact_matches) * 100
+    }
+
+def run_bge_grid_search_on_cache(df, precomputed_data, thresholds=[0.1, 0.3, 0.5, 0.7, 0.9], gt_col='preannotation'):
+    """
+    Exécute le Grid Search en utilisant le cache des scores BGE.
+    Applique le seuil BGE tout en conservant les base_cits.
+    """
+    print(f"\n{'='*80}")
+    print(f"{'GRID SEARCH BGE (SEEK FILTRÉ + CONSERVATION BASE) PAR SNIPPET':^80}")
+    print(f"{'='*80}")
+    print(f"{'Seuil':<8} | {'Rappel %':<10} | {'Précision %':<12} | {'F1 %':<8} | {'Exact %':<9}")
+    print(f"{'-'*80}")
+    
+    best_f1 = 0
+    best_thres = 0
+    
+    for thres in thresholds:
+        all_gt_snippets = []
+        all_pred_snippets = []
+        
+        for idx, row in df.iterrows():
+            # Récupérer les données pré-annotées de la ligne (Ground Truth)
+            # Hypothèse: la GT est aussi stockée par snippet_id dans gt_col
+            gt_data = {int(x["snippet_id"]): set(x.get("citations", [])) for x in row.get(gt_col, [])}
+            
+            row_cache = precomputed_data.get(idx, {})
+            
+            for sid, s_data in row_cache.items():
+                pred_cited = set()
+                
+                # 1. Ajout obligatoire des citations de base
+                pred_cited.update(s_data["base_cits"])
+                
+                # 2. Ajout des candidats SEEK si leur score BGE >= thres
+                for c_id, score in s_data["bge_scores"].items():
+                    if score >= thres:
+                        pred_cited.add(c_id)
+                        
+                all_pred_snippets.append(pred_cited)
+                all_gt_snippets.append(gt_data.get(sid, set()))
+                
+        metrics = evaluate_per_snippet_metrics(all_gt_snippets, all_pred_snippets)
+        
+        print(f"{thres:<8.2f} | {metrics['mean_recall']:<10.2f} | {metrics['mean_precision']:<12.2f} | "
+              f"{metrics['mean_f1']:<8.2f} | {metrics['pct_exact']:<9.2f}")
+        
+        if metrics["mean_f1"] > best_f1:
+            best_f1 = metrics["mean_f1"]
+            best_thres = thres
+            
+    print(f"{'='*80}")
+    print(f"MEILLEUR SEUIL BGE : {best_thres} (F1: {best_f1:.2f}%)")
+    return best_thres
+
+
+
+
+
+
+
+import time
+
+# 1. On calcule et met en cache tous les scores (Opération lourde à ne faire qu'une fois)
+start_time = time.time()
+precomputed_cache = compute_and_cache_bge_scores(
+    df=df, # Votre dataframe
+    embed_model=embed_model, 
+    bge_model=model, # Votre modèle BGE
+    bge_tokenizer=tokenizer, 
+    batch_size=128
+)
+print(f"Mise en cache terminée en {time.time() - start_time:.2f}s")
+
+# 2. Grid search très rapide sur les seuils
+thres_list = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+best_threshold = run_bge_grid_search_on_cache(
+    df=df,
+    precomputed_data=precomputed_cache,
+    thresholds=thres_list,
+    gt_col='preannotation' # Assurez-vous que c'est le bon nom de colonne pour la vérité terrain
+)
