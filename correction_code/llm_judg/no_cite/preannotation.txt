@@ -1,0 +1,65 @@
+import ast
+from collections import Counter
+from typing import List
+import pandas as pd
+
+def clean_predictions(df: pd.DataFrame, col_names: List[str]) -> pd.DataFrame:
+    """
+    Converts raw prediction strings (e.g., "[1, 2]" or "1, 2") into lists of integers.
+    """
+    def parse_pred(val):
+        if not val or not isinstance(val, str) or "Error:" in val:
+            return []
+
+        val = val.strip()
+
+        # Essai 1: Format Python/JSON propre (ex: "[1, 2, 3]")
+        try:
+            parsed = ast.literal_eval(val)
+            if isinstance(parsed, list):
+                return [int(x) for x in parsed]
+            if isinstance(parsed, (int, float)):
+                return [int(parsed)]
+        except (ValueError, SyntaxError):
+            pass
+
+        # Essai 2: Fallback si le modèle répond juste "1, 2, 3"
+        try:
+            # Nettoyage des crochets résiduels éventuels
+            val = val.replace('[', '').replace(']', '')
+            return [int(x.strip()) for x in val.split(',') if x.strip().isdigit()]
+        except ValueError:
+            return []
+
+    df_copy = df.copy()
+    for col in col_names:
+        if col in df_copy.columns:
+            df_copy[col] = df_copy[col].apply(parse_pred)
+    
+    return df_copy
+
+
+def majority_vote(df: pd.DataFrame, judge_cols: List[str]) -> pd.DataFrame:
+    """
+    Computes consensus by majority vote. 
+    Keeps an ID if >= 2 judges predicted it.
+    """
+    def vote(row):
+        all_ids = []
+        for col in judge_cols:
+            ids = row.get(col, [])
+            if isinstance(ids, list):
+                all_ids.extend(ids)
+
+        if not all_ids:
+            return []
+
+        counts = Counter(all_ids)
+        # On garde si au moins 2 modèles sont d'accord
+        consensus = [id_ for id_, count in counts.items() if count >= 2]
+        return sorted(consensus)
+
+    df_copy = df.copy()
+    # Le nom "preannotation" est utilisé pour correspondre à ton standard
+    df_copy['preannotation'] = df_copy.apply(vote, axis=1)
+    return df_copy

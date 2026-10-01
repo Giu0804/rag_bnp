@@ -1,0 +1,134 @@
+import pandas as pd 
+import asyncio 
+
+from llm_judge import LLMJudge, run_judge_pipeline 
+from preannotation import clean_predictions, majority_vote
+
+# --- USER CONFIGURATION ---
+
+# 1. Judge Settings
+judge_config_gemma_local = {
+    "judge_type": "vllm",
+    "base_url": "http://0.0.0.0:8881/v1/",
+    "model_name": None,
+    "supports_xhigh": False
+}
+
+judge_config_gpt = {
+    "judge_type": "llmas",
+    "base_url": "URL_MASQUEE",
+    "model_name": "gpt-oss-120b",
+    "supports_xhigh": False
+}
+
+judge_config_qwen = {
+    "judge_type": "qwen",
+    "base_url": "URL_MASQUEE",
+    "model_name": "Qwen3.8-27B-FP8",
+    "supports_xhigh": True
+}
+
+# 2. Column Names mapped to models
+judge_col_names = {
+    "gemma": "pred_gemma",
+    "gpt": "pred_gpt",
+    "qwen": "pred_qwen"
+}
+
+# 3. Prompts
+sys_prompt_answer = """### ROLE:
+You are a precise context identifier. Your goal is to identify the paragraphs from the [CONTEXT] that were used to write the [ANSWER].
+
+### PRE-REQUISITE
+Before generating ANY text, READ CAREFULLY the ENTIRE [CONTEXT] and the [ANSWER].
+NEVER rely on your prior knowledge to answer.
+
+### DEFINITIONS
+In the [CONTEXT], evidence is formatted as : "ID: [number] | Paragraph [text]".
+- "ID": The numerical identifier
+- "Paragraph": The factual content.
+
+### INSTRUCTIONS
+0. **Case - Insufficient information** : If the [ANSWER] states that there is no sufficient information, DO NOT select any paragraphs and SKIP the following rules.
+1. **Step 1 - SEQUENTIAL ANALYSIS**: For each paragraph, read the [ANSWER] and ask "is it needed to obtain some information in the answer?" if YES, INCLUDE it, if NO, DISCARD it.
+2. **Step 2 - Completeness and indirect link**: Include paragraphs that identify intermediate entities used in the answer.
+3. **Step 3 - Ablation test**: If I remove this paragraph, can I still obtain this complete answer? If YES, discard it.
+4. **Step 4 - Selection**: Select the IDs of the paragraphs that meet all requirements.
+
+### OUTPUT FORMAT:
+[Comma-separated list of numerical IDs ONLY in brackets]"""
+
+user_prompt_answer = """### [CONTEXT]:
+{context_text}
+
+### [ANSWER]:
+{answer_text}
+
+---
+Reminder: ONLY provide the IDs of the paragraphs in a comma-separated list."""
+
+# 4. Pipeline Settings
+batch_size = 16
+temperature = 0.0
+max_tokens = 512
+
+input_path = "BOT_data_ANSWERS.parquet"
+output_path_final = "BOT_data_FINAL_JUDGED.parquet"
+
+# --- EXECUTION ---
+
+# 0. Load data (on teste sur les 10 premières lignes pour être sûr)
+df_answers = pd.read_parquet(input_path).head(10)
+print(f"Loaded {len(df_answers)} samples.")
+
+if 'generated_answer' not in df_answers.columns:
+    raise ValueError("Column 'generated_answer' not found in input data.")
+
+# 1. Run Judge 1 (Gemma)
+print("\n--- Running Judge 1: Gemma ---")
+judge_1 = LLMJudge(**judge_config_gemma_local)
+df_j1 = asyncio.run(run_judge_pipeline(
+    data=df_answers, judge=judge_1,
+    system_prompt=sys_prompt_answer, user_prompt_template=user_prompt_answer,
+    batch_size=batch_size, temperature=temperature, max_tokens=max_tokens
+))
+df_j1 = df_j1.rename(columns={'prediction': judge_col_names['gemma']})
+
+# 2. Run Judge 2 (GPT)
+print("\n--- Running Judge 2: GPT ---")
+judge_2 = LLMJudge(**judge_config_gpt)
+df_j2 = asyncio.run(run_judge_pipeline(
+    data=df_answers, judge=judge_2,
+    system_prompt=sys_prompt_answer, user_prompt_template=user_prompt_answer,
+    batch_size=batch_size, temperature=temperature, max_tokens=max_tokens
+))
+df_j2 = df_j2.rename(columns={'prediction': judge_col_names['gpt']})
+
+# 3. Run Judge 3 (Qwen)
+print("\n--- Running Judge 3: Qwen ---")
+judge_3 = LLMJudge(**judge_config_qwen)
+df_j3 = asyncio.run(run_judge_pipeline(
+    data=df_answers, judge=judge_3,
+    system_prompt=sys_prompt_answer, user_prompt_template=user_prompt_answer,
+    batch_size=batch_size, temperature=temperature, max_tokens=max_tokens
+))
+df_j3 = df_j3.rename(columns={'prediction': judge_col_names['qwen']})
+
+# 4. Merge into Original DataFrame
+print("\n--- Merging results ---")
+df_final = df_answers.copy()
+# On utilise how='left' pour s'assurer que l'ordre et le nombre de lignes initial est respecté
+df_final = df_final.merge(df_j1[['sample_id', judge_col_names['gemma']]], on='sample_id', how='left')
+df_final = df_final.merge(df_j2[['sample_id', judge_col_names['gpt']]], on='sample_id', how='left')
+df_final = df_final.merge(df_j3[['sample_id', judge_col_names['qwen']]], on='sample_id', how='left')
+
+# 5. Clean & Vote
+print("--- Cleaning formatting and computing Majority Vote ---")
+judge_cols = list(judge_col_names.values())
+df_final = clean_predictions(df_final, judge_cols)
+df_final = majority_vote(df_final, judge_cols)
+
+# 6. Save
+df_final.to_parquet(output_path_final, index=False)
+print(f"Final pipeline complete. Saved to {output_path_final}")
+display(df_final[['sample_id', 'preannotation'] + judge_cols].head())

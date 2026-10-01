@@ -1,0 +1,48 @@
+import re
+import string
+
+def parse_inline_citations(text: str) -> list:
+    """
+    Parses a text string with inline citations (e.g., "Sentence [1, 2].")
+    and splits it into statements with their associated citation IDs.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return []
+
+    parts = re.split(r'(\[[^\]]+\])', text)
+    result = []
+    text_buffer = ""
+    snippet_id = 0
+
+    for segment in parts:
+        if segment.startswith('[') and segment.endswith(']'):
+            if text_buffer.strip():
+                ids_str = segment[1:-1]
+                try:
+                    citations = [int(x.strip()) for x in ids_str.split(',')]
+                except ValueError:
+                    citations = []
+
+                clean_text = text_buffer.rstrip(string.punctuation).strip()
+                if clean_text:
+                    result.append({
+                        "snippet_id": snippet_id,
+                        "text": clean_text,
+                        "citations": citations
+                    })
+                    snippet_id += 1
+                text_buffer = ""
+        else:
+            text_buffer += segment
+
+    # Gestion de la dernière phrase (sans citation finale)
+    if text_buffer.strip():
+        clean_text = text_buffer.rstrip(string.punctuation).strip()
+        if clean_text:
+            result.append({
+                "snippet_id": snippet_id,
+                "text": clean_text,
+                "citations": []
+            })
+
+    return result

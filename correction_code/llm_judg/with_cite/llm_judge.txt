@@ -1,0 +1,156 @@
+import asyncio
+import time
+import os
+import requests
+import pandas as pd
+from typing import List, Dict, Any, Optional
+from openai import AsyncOpenAI
+
+class LLMJudge:
+    """
+    Unified LLM Judge for evaluating context usage in specific statements.
+    """
+    def __init__(
+        self,
+        judge_type: str = "vllm",
+        base_url: Optional[str] = None,
+        model_name: Optional[str] = None,
+        api_key: Optional[str] = None,
+        supports_xhigh: bool = False
+    ):
+        self.judge_type = judge_type
+        self.supports_xhigh = supports_xhigh
+        self.model_name = model_name
+        self.base_url = base_url
+
+        if api_key is None:
+            if judge_type in ["vllm", "qwen"]:
+                try:
+                    api_key = requests.get("http://localhost:8899/access-token").text
+                except Exception as e:
+                    api_key = "EMPTY"
+            else:
+                api_key = os.getenv("LLM_API_KEY", "EMPTY")
+
+        if judge_type in ["qwen", "llmas"]:
+            ca_bundle = os.getenv("REQUESTS_CA_BUNDLE")
+            if ca_bundle:
+                os.environ["SSL_CERT_FILE"] = ca_bundle
+
+        self.client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+
+    async def _get_model_name(self) -> str:
+        if self.model_name:
+            return self.model_name
+        models = await self.client.models.list()
+        if not models.data:
+            raise ValueError("No models available.")
+        self.model_name = models.data[0].id
+        return self.model_name
+
+    async def judge_statement(
+        self,
+        question: str,
+        statement: str,
+        context_chunks: List[Dict[str, Any]],
+        system_prompt: str,
+        user_prompt_template: str,
+        temperature: float = 0.0,
+        max_tokens: int = 512
+    ) -> Dict[str, Any]:
+        
+        context_text = "\n".join([f"ID: {c.get('id', i)} | Paragraph: {c.get('text', '')}" for i, c in enumerate(context_chunks)])
+        user_prompt = user_prompt_template.format(
+            context_text=context_text,
+            snippet_text=statement
+        )
+
+        model_name = await self._get_model_name()
+
+        kwargs = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+
+        if self.judge_type == "qwen":
+            kwargs["stream"] = True
+            kwargs["stream_options"] = {"include_usage": True}
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": True}}
+            kwargs["reasoning_effort"] = "xhigh" if self.supports_xhigh else "high"
+        elif self.judge_type in ["llmas", "vllm"]:
+            kwargs.setdefault("extra_body", {})["reasoning_effort"] = "high"
+
+        start_time = time.time()
+        try:
+            if self.judge_type == "qwen":
+                response = await self.client.chat.completions.create(**kwargs)
+                answer_content = ""
+                async for chunk in response:
+                    if chunk.choices:
+                        delta = chunk.choices[0].delta
+                        if hasattr(delta, "content") and delta.content:
+                            answer_content += delta.content
+                prediction = answer_content.strip()
+            else:
+                response = await self.client.chat.completions.create(**kwargs)
+                prediction = response.choices[0].message.content.strip()
+
+            latency = time.time() - start_time
+            return {"prediction": prediction, "latency": latency, "model": model_name}
+            
+        except Exception as e:
+            latency = time.time() - start_time
+            return {"prediction": f"Error: {str(e)}", "latency": latency, "model": model_name, "error": str(e)}
+
+async def run_judge_pipeline(
+    data: pd.DataFrame,
+    judge: LLMJudge,
+    system_prompt: str,
+    user_prompt_template: str,
+    batch_size: int = 16,
+    temperature: float = 0.0,
+    max_tokens: int = 512
+) -> pd.DataFrame:
+    
+    semaphore = asyncio.Semaphore(batch_size)
+
+    async def process_statement(sample_idx, question, contexts, snippet):
+        async with semaphore:
+            result = await judge.judge_statement(
+                question=question,
+                statement=snippet['text'],
+                context_chunks=contexts,
+                system_prompt=system_prompt,
+                user_prompt_template=user_prompt_template,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+            
+            # On clone le snippet original et on y ajoute le jugement de ce modèle
+            judged_snippet = dict(snippet)
+            judged_snippet["prediction"] = result['prediction']
+            return judged_snippet
+
+    # On prépare le nouveau DataFrame
+    final_rows = []
+    
+    for _, row in data.iterrows():
+        new_row = row.to_dict()
+        inline_processed = row.get('inline_processed', [])
+        
+        # On crée des tâches pour chaque snippet de cette ligne
+        tasks = [process_statement(row['sample_id'], row['question'], row['contexts'], snip) for snip in inline_processed]
+        
+        # On attend la résolution des snippets pour cette ligne (on pourrait l'aplatir totalement, mais on garde la structure par ligne)
+        judged_snippets = await asyncio.gather(*tasks)
+        
+        # On remplace l'ancienne liste par la nouvelle liste contenant les 'prediction'
+        new_row['judged_inline'] = judged_snippets
+        final_rows.append(new_row)
+
+    return pd.DataFrame(final_rows)

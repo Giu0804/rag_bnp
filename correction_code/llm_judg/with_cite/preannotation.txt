@@ -1,0 +1,103 @@
+import ast
+import numpy as np
+import pandas as pd
+from collections import Counter
+from typing import List
+
+def convert_predictions_int_multi(df: pd.DataFrame, col_names: List[str]) -> pd.DataFrame:
+    """
+    Parses the 'prediction' field within nested snippet lists into Python lists of integers.
+    """
+    def process_row(row_list):
+        if not isinstance(row_list, list):
+            return []
+
+        new_list = []
+        for snippet in row_list:
+            if not isinstance(snippet, dict):
+                new_list.append(snippet)
+                continue
+
+            s = dict(snippet)
+            if 'prediction' in s:
+                val = s['prediction']
+                s['prediction'] = None 
+
+                if isinstance(val, str) and val.strip() != "":
+                    try:
+                        parsed = ast.literal_eval(val)
+                        if isinstance(parsed, list):
+                            int_list = [int(x) for x in parsed]
+                        else:
+                            int_list = [int(parsed)]
+                        s['prediction'] = int_list
+                    except Exception:
+                        pass # Laisser à None
+                elif isinstance(val, list):
+                    try:
+                        s['prediction'] = [int(x) for x in val]
+                    except Exception:
+                        pass
+                        
+            new_list.append(s)
+        return new_list
+
+    df_copy = df.copy()
+    for col in col_names:
+        if col in df_copy.columns:
+            df_copy[col] = df_copy[col].apply(process_row)
+            
+    return df_copy
+
+
+def pre_annotation(df: pd.DataFrame, judge_cols: List[str]) -> pd.DataFrame:
+    """
+    Applies Majority Vote on snippet-level predictions across multiple judges.
+    """
+    def merge_snippets(row):
+        sources = {f"judge_{i}": row.get(col, []) for i, col in enumerate(judge_cols)}
+        merged_dict = {}
+
+        for model_name, snippets in sources.items():
+            if not isinstance(snippets, list): continue
+
+            for item in snippets:
+                if not isinstance(item, dict): continue
+
+                sid = item.get('snippet_id')
+                if sid is None: continue
+
+                if sid not in merged_dict:
+                    merged_dict[sid] = {
+                        'snippet_id': sid,
+                        'text': item.get('text', ''),
+                        'original_citations': item.get('citations', []),
+                        'votes': Counter()
+                    }
+
+                pred_val = item.get('prediction')
+                preds = pred_val if isinstance(pred_val, list) else []
+
+                # Set for unique votes from this specific model on this snippet
+                unique_preds = set(preds)
+                merged_dict[sid]['votes'].update(unique_preds)
+
+        result_list = []
+        for sid in sorted(merged_dict.keys()):
+            data = merged_dict[sid]
+            
+            # Consensus: Keep if >= 2 models agree
+            consensus_preds = [val for val, count in data['votes'].items() if count >= 2]
+
+            result_list.append({
+                'snippet_id': data['snippet_id'],
+                'text': data['text'],
+                'model_inline_citation': data['original_citations'], # La vraie citation posée par le modèle
+                'GT_cited': sorted(consensus_preds) # Ce que les juges valident
+            })
+
+        return result_list
+
+    df_copy = df.copy()
+    df_copy['preannotation'] = df_copy.apply(merge_snippets, axis=1)
+    return df_copy

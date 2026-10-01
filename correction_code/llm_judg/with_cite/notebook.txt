@@ -1,0 +1,51 @@
+import pandas as pd 
+import asyncio 
+
+from utils import parse_inline_citations
+from llm_judge import LLMJudge, run_judge_pipeline 
+from preannotation import convert_predictions_int_multi, pre_annotation
+
+# 1. Configurations 
+judge_config_gemma = {"judge_type": "vllm", "base_url": "...", "supports_xhigh": False}
+judge_config_gpt = {"judge_type": "llmas", "base_url": "...", "supports_xhigh": False}
+judge_config_qwen = {"judge_type": "qwen", "base_url": "...", "supports_xhigh": True}
+
+judge_col_names = {"gemma": "pred_gemma", "gpt": "pred_gpt", "qwen": "pred_qwen"}
+
+sys_prompt = "You are a snippet evaluator..."
+user_prompt = "Context:\n{context_text}\nSnippet:\n{snippet_text}\nAnswer (IDs):"
+
+# 2. Load and Prepare Data
+df_answers = pd.read_parquet("BOT_data_ANSWERS_INLINE.parquet").head(5)
+
+# TRES IMPORTANT: On applique ton parser Regex avant les juges !
+df_answers['inline_processed'] = df_answers['generated_answer'].apply(parse_inline_citations)
+
+# 3. Execution Asynchrone
+print("--- Gemma ---")
+judge_1 = LLMJudge(**judge_config_gemma)
+df_j1 = asyncio.run(run_judge_pipeline(df_answers, judge_1, sys_prompt, user_prompt))
+df_j1 = df_j1.rename(columns={'judged_inline': judge_col_names['gemma']})
+
+print("--- GPT ---")
+judge_2 = LLMJudge(**judge_config_gpt)
+df_j2 = asyncio.run(run_judge_pipeline(df_answers, judge_2, sys_prompt, user_prompt))
+df_j2 = df_j2.rename(columns={'judged_inline': judge_col_names['gpt']})
+
+print("--- Qwen ---")
+judge_3 = LLMJudge(**judge_config_qwen)
+df_j3 = asyncio.run(run_judge_pipeline(df_answers, judge_3, sys_prompt, user_prompt))
+df_j3 = df_j3.rename(columns={'judged_inline': judge_col_names['qwen']})
+
+# 4. Merging
+df_final = df_answers.copy()
+df_final = df_final.merge(df_j1[['sample_id', judge_col_names['gemma']]], on='sample_id', how='left')
+df_final = df_final.merge(df_j2[['sample_id', judge_col_names['gpt']]], on='sample_id', how='left')
+df_final = df_final.merge(df_j3[['sample_id', judge_col_names['qwen']]], on='sample_id', how='left')
+
+# 5. Parsing & Majority Vote
+judge_cols = list(judge_col_names.values())
+df_final = convert_predictions_int_multi(df_final, judge_cols)
+df_final = pre_annotation(df_final, judge_cols)
+
+df_final.to_parquet("BOT_data_FINAL_INLINE_JUDGED.parquet", index=False)
