@@ -1,0 +1,23 @@
+### 3. Answer Generation (Inline Citation)
+
+```markdown
+# Answer Generation (Strict Inline Citations)
+
+## Overview & Goal
+This module generates answers based on retrieved contexts, but with a strict structural constraint: the LLM must cite its sources at the end of each sentence using inline brackets (e.g., `[1]`, `[2, 3]`). To prevent hallucinated formats or unparseable outputs, this module uses **Constrained Decoding** via an EBNF grammar (using Outlines integration). It forces the LLM at the token-generation level to respect the citation syntax.
+
+## Architecture
+This pipeline specifically targets a **vLLM server** capable of understanding the `guided_grammar` parameter in the `extra_body` payload of the OpenAI-compatible API. 
+The architecture features a global EBNF (Extended Backus-Naur Form) variable that defines the exact permitted syntax for sentences and citations. The asynchronous engine (`asyncio.Semaphore`) pushes concurrent requests to the server, injecting the EBNF constraint into every call. Like the standard generator, it safely catches API errors, respects model-specific reasoning flags (`xhigh`), and sorts the final DataFrame.
+
+## File Structure
+- `answer_generation.py`: Contains the `AnswerGenerator` and `run_answer_pipeline`. It prominently features the `EBNF_GRAMMAR` global variable at the top, which defines the strict citation syntax (e.g., `sentence [id].`), and injects it into the API call payloads.
+- `notebook_inline_citation.ipynb`: The execution notebook. It configures the vLLM server details, loads the context data, explicitly activates the citation prompt, and stores the heavily constrained generated answers.
+
+## Requirements
+Create a `requirements.txt` file in this directory with the following content:
+```text
+pandas
+openai
+requests
+pyarrow
