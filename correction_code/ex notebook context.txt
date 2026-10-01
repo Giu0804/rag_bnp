@@ -1,0 +1,70 @@
+import sys
+import os
+import pandas as pd
+
+# 1. SETUP PATHS
+ROOT = os.path.abspath('..')
+sys.path.append(os.path.join(ROOT, 'bot')) 
+sys.path.append(os.path.join(ROOT, 'public_data'))
+
+# 2. IMPORTS
+from bot.run_context_bot import create_retrieved_contexts
+from public_data.run_context_pub import filtrer_dataset_rag_par_score
+from bot.scorers import QwenRerankerScorer
+
+MODEL_PATH = "path/to/qwen/model"
+
+# ==========================================
+# DATASET 1: BOT_data (Besoin d'être scoré)
+# ==========================================
+print("--- Démarrage Dataset 1 (Bot) ---")
+
+# On charge le Scorer (Attention, ça prend de la mémoire GPU)
+print("Chargement du modèle de Reranking...")
+scorer_ds1 = QwenRerankerScorer(MODEL_PATH)
+
+df1 = create_retrieved_contexts(
+    bot_data_file="path/to/bot_data.json",
+    chunks_file="path/to/bot_chunks.pkl",  # Le fameux corpus
+    scorer=scorer_ds1,                     # On passe le modèle ici
+    gt_selection_ratio_min=0.5,
+    gt_selection_ratio_max=1.0,
+    gt_context_ratio_min=0.1,
+    gt_context_ratio_max=0.6,
+    gt_context_ratio_min_low_gold=0.05,
+    gt_context_ratio_max_low_gold=0.35,
+    low_gold_threshold=2,
+    n_fallback_chunks=10,
+    seed=42
+)
+df1.to_parquet("output/ds1.parquet", index=False)
+print(f"DS1 Terminé : {df1.shape}")
+
+# On peut vider la mémoire GPU si besoin avant de passer à la suite
+import gc, torch
+del scorer_ds1
+gc.collect()
+torch.cuda.empty_cache()
+
+
+# ==========================================
+# DATASET 2: public_data (Déjà scoré)
+# ==========================================
+print("\n--- Démarrage Dataset 2 (Public) ---")
+
+# Lecture du fichier qui contient DÉJÀ les scores
+df2_raw = pd.read_json("path/to/public_data_scored.json")
+
+# On filtre simplement, SANS charger le LLM
+df2 = filtrer_dataset_rag_par_score(
+    df2_raw,
+    gt_selection_ratio_min=0.3,
+    gt_selection_ratio_max=1.0,
+    gt_proportion_min=0.05,
+    gt_proportion_max=0.70,
+    gt_proportion_min_low_gold=0.05,
+    gt_proportion_max_low_gold=0.35,
+    low_gold_threshold=2
+)
+df2.to_parquet("output/ds2.parquet", index=False)
+print(f"DS2 Terminé : {df2.shape}")

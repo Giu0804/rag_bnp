@@ -1,0 +1,86 @@
+import pandas as pd
+import pickle
+from tqdm import tqdm
+from .utils import get_texts2
+from .context_composer import ContextComposer, ComposedContext, ContextStrategy
+
+def create_retrieved_contexts(
+    bot_data_file: str,
+    chunks_file: str,
+    scorer, # L'objet QwenRerankerScorer passé depuis le notebook
+    gt_selection_ratio_min: float = 0.5,
+    gt_selection_ratio_max: float = 1.0,
+    gt_context_ratio_min: float = 0.1,
+    gt_context_ratio_max: float = 0.6,
+    gt_context_ratio_min_low_gold: float = 0.05,
+    gt_context_ratio_max_low_gold: float = 0.35,
+    low_gold_threshold: int = 2,
+    n_fallback_chunks: int = 10,
+    seed: int = 42
+) -> pd.DataFrame:
+    """
+    Gère les données BOT : Charge le corpus PKL, extrait les textes, calcule les scores et génère les contextes.
+    """
+    
+    # 1. Charger le corpus de chunks (PKL)
+    print("Chargement du corpus de chunks (.pkl)...")
+    with open(chunks_file, 'rb') as f:
+        chunk_data = pickle.load(f)
+
+    # 2. Extraire le texte de chaque chunk du corpus
+    all_chunks_text = []
+    for chunk in chunk_data:
+        # On suppose que le texte est dans page_content ou text
+        text = getattr(chunk, 'page_content', getattr(chunk, 'text', str(chunk)))
+        all_chunks_text.append(text)
+        
+        # Optionnel : si tu as besoin de filtrer par domaine plus tard
+        # domain = chunk.metadata.get('domain') 
+        
+    # 3. Initialiser le ContextComposer avec TOUT le corpus
+    composer = ContextComposer(
+        chunks=all_chunks_text,
+        scorer=scorer,
+        seed=seed,
+        gt_selection_ratio_min=gt_selection_ratio_min,
+        gt_selection_ratio_max=gt_selection_ratio_max,
+        gt_context_ratio_min=gt_context_ratio_min,
+        gt_context_ratio_max=gt_context_ratio_max,
+        gt_context_ratio_min_low_gold=gt_context_ratio_min_low_gold,
+        gt_context_ratio_max_low_gold=gt_context_ratio_max_low_gold,
+        low_gold_threshold=low_gold_threshold,
+        n_fallback_chunks=n_fallback_chunks
+    )
+
+    # 4. Charger les données du bot (JSON)
+    print("Chargement des données BOT (json)...")
+    df = pd.read_json(bot_data_file)
+    new_rows = []
+
+    print("Création et scoring des contextes...")
+    for idx, row in tqdm(df.iterrows(), total=len(df)):
+        question = row['question']
+        
+        # C'EST ICI QU'ON APPLIQUE get_texts2() sur la ligne !
+        gt_chunks_flat = get_texts2(row.get('GT_chunks', []))
+
+        # Préparation de l'objet de configuration pour le composer
+        initial_context = ComposedContext(
+            strategy=ContextStrategy.PARTIAL_V2,
+            gt_chunks=gt_chunks_flat,
+            relevant_ratio=0.0
+        )
+
+        # Lancement de la composition (qui va déclencher le scorer)
+        composed = composer.compose(
+            question=question,
+            composed_context=initial_context
+        )
+
+        # Sauvegarde
+        new_row = row.to_dict()
+        new_row['contexts'] = composed.context # Le résultat scoré et mélangé
+        new_row['infos_chunks'] = composed.info_chunks
+        new_rows.append(new_row)
+
+    return pd.DataFrame(new_rows)

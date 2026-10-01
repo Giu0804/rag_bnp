@@ -1,0 +1,98 @@
+import pandas as pd
+import random
+import math
+
+def filtrer_dataset_rag_par_score(
+    df: pd.DataFrame,
+    gt_selection_ratio_min: float = 0.3,
+    gt_selection_ratio_max: float = 1.0,
+    gt_proportion_min: float = 0.05,
+    gt_proportion_max: float = 0.70,
+    gt_proportion_min_low_gold: float = 0.05,
+    gt_proportion_max_low_gold: float = 0.35,
+    low_gold_threshold: int = 2
+) -> pd.DataFrame:
+    """
+    Filtre un dataset public où les chunks ont DÉJÀ été scorés.
+    """
+    print("Filtrage des données publiques (Scores déjà présents)...")
+    new_rows = []
+    
+    for _, row in df.iterrows():
+        sample_id = row.get("id")
+        question = row.get("question")
+        contexts = row.get("contexts", []) # Les scores sont déjà là
+        gold_ids = row.get("gold_ids", [])
+
+        if not contexts:
+            continue
+
+        gold_ids_set = set(str(gid) for gid in gold_ids)
+        gold_chunks = [c for c in contexts if str(c.get("id")) in gold_ids_set]
+        non_gold_chunks = [c for c in contexts if str(c.get("id")) not in gold_ids_set]
+        n_total_gold = len(gold_chunks)
+
+        # Si pas de Gold
+        if n_total_gold == 0:
+            n_add = min(len(non_gold_chunks), random.randint(2, 10))
+            selected_contexts = sorted(non_gold_chunks, key=lambda x: x.get("score", 0.0), reverse=True)[:n_add]
+            random.shuffle(selected_contexts)
+            infos = {"nb_chunks": len(selected_contexts), "GT_selected": 0.0, "GT_proportion": 0.0, "non_gold_strategy": "top_k"}
+            new_rows.append({"id": sample_id, "question": question, "contexts": selected_contexts, "gold_ids": [], "infos_chunks": infos})
+            continue
+
+        # Select GT
+        prop_gt_target = random.uniform(gt_selection_ratio_min, gt_selection_ratio_max)
+        n_selected_gold = max(1, math.ceil(n_total_gold * prop_gt_target))
+        random.shuffle(gold_chunks)
+        final_gold_chunks = gold_chunks[:n_selected_gold]
+
+        # Select Noise
+        strategy_choice = random.choice(["top_k", "bottom_k"])
+        if strategy_choice == "top_k":
+            sorted_candidates = sorted(non_gold_chunks, key=lambda x: x.get("score", 0.0), reverse=True)
+        else:
+            sorted_candidates = sorted(non_gold_chunks, key=lambda x: x.get("score", 0.0), reverse=False)
+
+        if n_selected_gold <= low_gold_threshold:
+            p_high = gt_proportion_max_low_gold
+            p_low = gt_proportion_min_low_gold
+        else:
+            p_high = gt_proportion_max
+            p_low = gt_proportion_min
+
+        min_n_non_gold = math.ceil(n_selected_gold * (1 - p_high) / p_high)
+        max_ratio_limit = math.floor(n_selected_gold * (1 - p_low) / p_low)
+        available_non_gold = len(sorted_candidates)
+        max_possible_n = min(max_ratio_limit, available_non_gold)
+
+        if min_n_non_gold > max_possible_n:
+            continue
+
+        n_to_add = random.randint(min_n_non_gold, max_possible_n)
+        selected_non_gold = sorted_candidates[:n_to_add]
+
+        final_contexts = final_gold_chunks + selected_non_gold
+        random.shuffle(final_contexts)
+
+        total_chunks = len(final_contexts)
+        n_final_gold = len(final_gold_chunks)
+        actual_GT_selected_ratio = n_final_gold / n_total_gold if n_total_gold > 0 else 0.0
+        final_GT_proportion = n_final_gold / total_chunks if total_chunks > 0 else 0.0
+
+        infos = {
+            "nb_chunks": total_chunks,
+            "GT_selected": round(actual_GT_selected_ratio, 3),
+            "GT_proportion": round(final_GT_proportion, 3),
+            "non_gold_strategy": strategy_choice
+        }
+
+        new_rows.append({
+            "id": sample_id,
+            "question": question,
+            "contexts": final_contexts,
+            "gold_ids": [c["id"] for c in final_gold_chunks],
+            "infos_chunks": infos
+        })
+
+    return pd.DataFrame(new_rows)
