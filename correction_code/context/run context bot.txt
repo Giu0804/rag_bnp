@@ -198,4 +198,116 @@ def create_retrieved_contexts(
         new_row['infos_chunks'] = composed.info_chunks
         new_rows.append(new_row)
 
-    return pd.DataFrame(new_rows)s
+    return pd.DataFrame(new_rows)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import pandas as pd
+import pickle
+from tqdm import tqdm
+from .utils import get_texts2
+from .context_composer import ContextComposer, ComposedContext, ContextStrategy
+
+def create_retrieved_contexts(
+    bot_data_file: str,
+    chunks_file: str,
+    scorer, 
+    gt_selection_ratio_min: float = 0.5,
+    gt_selection_ratio_max: float = 1.0,
+    gt_context_ratio_min: float = 0.1,
+    gt_context_ratio_max: float = 0.6,
+    gt_context_ratio_min_low_gold: float = 0.05,
+    gt_context_ratio_max_low_gold: float = 0.35,
+    low_gold_threshold: int = 2,
+    n_fallback_chunks: int = 10,
+    seed: int = 42
+) -> pd.DataFrame:
+    
+    # 1. Charger le corpus de chunks (PKL)
+    print("Chargement du corpus de chunks (.pkl)...")
+    with open(chunks_file, 'rb') as f:
+        chunks_data = pickle.load(f)
+
+    # 2. Construction de l'index des chunks par domaine (TON CODE EXACT)
+    print("Construction de l'index des chunks par domaine...")
+    chunks_by_domain = {}
+    for chunk in chunks_data:
+        domain = chunk.metadata.get('domain')
+        if domain:
+            if domain not in chunks_by_domain:
+                chunks_by_domain[domain] = []
+            chunks_by_domain[domain].append(chunk.page_content)
+
+    # 3. Charger les données du bot (JSON)
+    print("Chargement des données BOT (json)...")
+    df = pd.read_json(bot_data_file)
+    new_rows = []
+
+    print("Création et scoring des contextes...")
+    for idx, row in tqdm(df.iterrows(), total=len(df)):
+        question = row['question']
+        gt_chunks_flat = get_texts2(row.get('GT_chunks', []))
+
+        # Récupérer le domaine de la question actuelle
+        domain = row['metadata'][0]['domain']
+
+        # Ne prendre QUE les chunks de ce domaine
+        candidate_chunks = chunks_by_domain.get(domain, [])
+
+        # INITIALISER LE COMPOSER ICI, avec seulement les candidats
+        composer = ContextComposer(
+            chunks=candidate_chunks,
+            scorer=scorer,
+            seed=seed,
+            gt_selection_ratio_min=gt_selection_ratio_min,
+            gt_selection_ratio_max=gt_selection_ratio_max,
+            gt_context_ratio_min=gt_context_ratio_min,
+            gt_context_ratio_max=gt_context_ratio_max,
+            gt_context_ratio_min_low_gold=gt_context_ratio_min_low_gold,
+            gt_context_ratio_max_low_gold=gt_context_ratio_max_low_gold,
+            low_gold_threshold=low_gold_threshold,
+            n_fallback_chunks=n_fallback_chunks
+        )
+
+        initial_context = ComposedContext(
+            strategy=ContextStrategy.PARTIAL_V2,
+            gt_chunks=gt_chunks_flat,
+            relevant_ratio=0.0
+        )
+
+        composed = composer.compose(
+            question=question,
+            composed_context=initial_context
+        )
+
+        new_row = row.to_dict()
+        new_row['contexts'] = composed.context
+        new_row['infos_chunks'] = composed.info_chunks
+        new_rows.append(new_row)
+
+    return pd.DataFrame(new_rows)
