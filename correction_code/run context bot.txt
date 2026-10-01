@@ -84,3 +84,24 @@ def create_retrieved_contexts(
         new_rows.append(new_row)
 
     return pd.DataFrame(new_rows)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+################# a ajouter qlq part if self.scorer is None:
+    raise ValueError("Un scorer est requis pour cette stratégie.") das context compsoer

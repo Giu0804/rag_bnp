@@ -1,0 +1,148 @@
+import asyncio
+import time
+import json
+from typing import List, Dict, Any, Optional
+import pandas as pd
+from openai import AsyncOpenAI
+
+class AnswerGenerator:
+    """
+    Generates answers using an OpenAI-compatible API endpoint.
+    No constrained decoding is applied here.
+    """
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,  # CLÉ API OBLIGATOIRE
+        model_name: Optional[str] = None,
+        is_reasoning_model: bool = True,
+        supports_xhigh: bool = False
+    ):
+        if not api_key:
+            raise ValueError("api_key est obligatoire. (Mettre 'EMPTY' si serveur local sans auth).")
+            
+        self.base_url = base_url
+        self.is_reasoning_model = is_reasoning_model
+        self.supports_xhigh = supports_xhigh
+        self.client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        self.model_name = model_name
+
+    async def _get_model_name(self) -> str:
+        if self.model_name:
+            return self.model_name
+        models = await self.client.models.list()
+        if not models.data:
+            raise ValueError("No models available on the server.")
+        self.model_name = models.data[0].id
+        return self.model_name
+
+    async def generate_answer(
+        self,
+        question: str,
+        chunks: List[Dict[str, Any]],
+        system_prompt: str,
+        temperature: float = 0.0,
+        seed: int = 42,
+        max_tokens: int = 2048,
+        reasoning_effort: Optional[str] = None
+    ) -> Dict[str, Any]:
+        
+        # --- VALIDATION REASONING ---
+        if reasoning_effort:
+            if not self.is_reasoning_model:
+                raise ValueError("Model does not support 'reasoning_effort'.")
+            
+            # Ajustement automatique pour Qwen3-37B par exemple
+            if reasoning_effort == "high" and self.supports_xhigh:
+                reasoning_effort = "xhigh"
+            elif reasoning_effort == "xhigh" and not self.supports_xhigh:
+                raise ValueError("Ce modèle ne supporte pas 'xhigh'.")
+
+        context_str = "\n".join([f"[{c['id']}] {c['text']}" for c in chunks])
+        user_prompt = f"Reference Paragraphs:\n{context_str}\n\nQuestion: {question}\nAnswer:"
+
+        model_name = await self._get_model_name()
+
+        kwargs = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": temperature,
+            "seed": seed,
+            "max_tokens": max_tokens,
+        }
+
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
+
+        start_time = time.time()
+        try:
+            response = await self.client.chat.completions.create(**kwargs)
+            end_time = time.time()
+            return {
+                "answer": response.choices[0].message.content.strip(),
+                "latency": end_time - start_time,
+                "model": model_name
+            }
+        except Exception as e:
+            return {
+                "answer": f"Error: {str(e)}",
+                "latency": time.time() - start_time,
+                "model": model_name,
+                "error": str(e)
+            }
+
+
+async def run_answer_pipeline(
+    data: pd.DataFrame,
+    generator: AnswerGenerator,
+    system_prompt: str,
+    batch_size: int = 5,
+    temperature: float = 0.0,
+    seed: int = 42,
+    max_tokens: int = 2048,
+    reasoning_effort: Optional[str] = None
+) -> pd.DataFrame:
+    results = []
+    semaphore = asyncio.Semaphore(batch_size)
+
+    async def process_row(idx, row):
+        async with semaphore:
+            question = row["question"]
+            chunks = row["contexts"]
+            if isinstance(chunks, str):
+                try: chunks = json.loads(chunks)
+                except: chunks = []
+
+            result = await generator.generate_answer(
+                question=question, chunks=chunks, system_prompt=system_prompt,
+                temperature=temperature, seed=seed, max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort
+            )
+
+            results.append({
+                "sample_id": idx,
+                "question": question,
+                "contexts": chunks,
+                "gold_ids": row.get("gold_ids", []),
+                "generated_answer": result["answer"],
+                "latency": result["latency"],
+                "model": result["model"],
+                "infos_chunks": row.get('infos_chunks', {})
+            })
+            print(f"Processed sample {idx} | Latency: {result['latency']:.4f}s")
+
+    tasks = [process_row(idx, row) for idx, row in data.iterrows()]
+    await asyncio.gather(*tasks)
+
+    # TRI OBLIGATOIRE POUR MAINTENIR L'ORDRE
+    df_results = pd.DataFrame(results).sort_values("sample_id").reset_index(drop=True)
+    return df_results
+
+
+
+
+
+

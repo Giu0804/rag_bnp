@@ -1,0 +1,39 @@
+import pandas as pd
+import asyncio
+from answer_generation import AnswerGenerator, run_answer_pipeline
+
+base_url = "https://api.openai.com/v1" # Ou ton endpoint perso
+api_key = "sk-..." 
+model_name = None  
+
+is_reasoning_model = True       
+supports_xhigh = False    
+
+system_prompt = "You are a helpful assistant that answers questions using ONLY the provided reference paragraphs."
+reasoning_effort = "medium"
+max_tokens = 2048
+temperature = 0.0
+seed = 42
+batch_size = 5
+
+df_contexts = pd.read_parquet("BOT_data_RETRIEVED_CONTEXTS.parquet")
+
+generator = AnswerGenerator(
+    base_url=base_url,
+    api_key=api_key,
+    model_name=model_name,
+    is_reasoning_model=is_reasoning_model,
+    supports_xhigh=supports_xhigh
+)
+
+df_answers = asyncio.run(run_answer_pipeline(
+    data=df_contexts,
+    generator=generator,
+    system_prompt=system_prompt,
+    batch_size=batch_size,
+    temperature=temperature,
+    seed=seed,
+    max_tokens=max_tokens,
+    reasoning_effort=reasoning_effort
+))
+df_answers.to_parquet("BOT_data_ANSWERS.parquet")
